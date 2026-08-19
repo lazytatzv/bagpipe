@@ -15,7 +15,7 @@ impl Default for Config {
         Self {
             webhook_url: None,
             max_file_size_mb: Some(25), // Discord standard max upload size
-            zstd_level: Some(3),        // Fast & balanced
+            zstd_level: None,           // None = Smart Adaptive Auto-Tuning
         }
     }
 }

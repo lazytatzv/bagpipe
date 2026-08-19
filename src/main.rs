@@ -338,8 +338,13 @@ async fn handle_send(
         std::env::temp_dir().join(&archive_name)
     };
 
-    let zstd_level = cfg.zstd_level.unwrap_or(3);
-    pb.set_message(format!("Compressing with zstd (level {})...", zstd_level));
+    let max_mb = cfg.max_file_size_mb.unwrap_or(25);
+    let (zstd_level, mode_desc) = match cfg.zstd_level {
+        Some(lvl) if lvl > 0 => (lvl, "User-configured"),
+        _ => crate::compress::determine_optimal_zstd_level(&summary, max_mb),
+    };
+
+    pb.set_message(format!("Compressing with zstd (Level {}, {})...", zstd_level, mode_desc));
 
     let comp_start = std::time::Instant::now();
     let compressed_size = compress_bag_dir(&summary.bag_path, &archive_path, zstd_level)
@@ -357,7 +362,7 @@ async fn handle_send(
     println!("{}", "✨ Compression Complete!".green().bold());
     println!("  Original Size : {}", human_bytes::human_bytes(raw_size as f64).cyan());
     println!("  Compressed    : {}", human_bytes::human_bytes(compressed_size as f64).green().bold());
-    println!("  Ratio         : {:.1}% (in {:.2}s)", ratio, comp_elapsed.as_secs_f64());
+    println!("  Ratio         : {:.1}% (in {:.2}s, zstd: L{} {})", ratio, comp_elapsed.as_secs_f64(), zstd_level, mode_desc.dimmed());
     if keep_archive {
         println!("  Archive Saved : {}", archive_path.display());
     }
