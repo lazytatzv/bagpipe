@@ -145,6 +145,26 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Unpack / extract a compressed bag archive (.tar.zst)
+    Unpack {
+        /// Path to .tar.zst archive (defaults to latest in current directory)
+        archive: Option<PathBuf>,
+
+        /// Output directory to unpack into (defaults to current directory)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
+
+    /// Unpack and immediately play the bag using `ros2 bag play`
+    Play {
+        /// Path to .tar.zst archive or extracted bag folder (defaults to latest in current directory)
+        target: Option<PathBuf>,
+
+        /// Arguments passed transparently to `ros2 bag play` (e.g. `--loop`, `-r 2.0`, `/topic`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        ros2_args: Vec<String>,
+    },
+
     /// Manage configuration (view, set, get, or interactive edit)
     Config {
         #[command(subcommand)]
@@ -224,6 +244,14 @@ async fn main() -> Result<()> {
     // 4. Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
+            Commands::Unpack { archive, output } => {
+                let archive_path = resolve_archive_path(archive)?;
+                let out_dir = output.unwrap_or_else(|| PathBuf::from("."));
+                return handle_unpack(&archive_path, &out_dir);
+            }
+            Commands::Play { target, ros2_args } => {
+                return handle_play(target, ros2_args);
+            }
             Commands::Config { action } => {
                 return handle_config_action(action, &mut cfg);
             }
@@ -264,6 +292,11 @@ async fn main() -> Result<()> {
 
     let first_arg = &cli.raw_args[0];
     let first_path = PathBuf::from(first_arg);
+
+    // If first_arg is a .tar.zst archive file -> auto unpack / inspect
+    if first_path.exists() && (first_arg.ends_with(".tar.zst") || first_arg.ends_with(".tar.zstd") || first_arg.ends_with(".zst")) && cli.raw_args.len() == 1 {
+        return handle_unpack(&first_path, Path::new("."));
+    }
 
     if (first_path.exists() && (first_path.is_dir() || first_arg.ends_with(".db3") || first_arg.ends_with(".mcap")))
         && cli.raw_args.len() == 1
@@ -377,6 +410,98 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
             println!("{}", "✓ Configuration reset to defaults.".green().bold());
         }
     }
+    Ok(())
+}
+
+
+fn resolve_archive_path(path_opt: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = path_opt {
+        Ok(p)
+    } else {
+        let mut archives = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(".") {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                if p.is_file() && (name.ends_with(".tar.zst") || name.ends_with(".tar.zstd") || name.ends_with(".zst")) {
+                    if let Ok(meta) = p.metadata() {
+                        if let Ok(mod_time) = meta.modified() {
+                            archives.push((p, mod_time));
+                        }
+                    }
+                }
+            }
+        }
+        archives.sort_by(|a, b| b.1.cmp(&a.1));
+        if let Some((latest, _)) = archives.into_iter().next() {
+            Ok(latest)
+        } else {
+            anyhow::bail!("No .tar.zst archive found in current directory. Specify path with `bp unpack <FILE>`.");
+        }
+    }
+}
+
+fn handle_unpack(archive_path: &Path, output_dir: &Path) -> Result<()> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
+            .template("{spinner:.green} {msg}")?,
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb.set_message(format!("Decompressing {} with zstd...", archive_path.display()));
+
+    let start = std::time::Instant::now();
+    let extracted_path = crate::compress::decompress_archive(archive_path, output_dir)?;
+    let elapsed = start.elapsed();
+
+    pb.finish_and_clear();
+
+    println!("{}", "✓ Decompression Complete!".green().bold());
+    println!("  Extracted to : {}", extracted_path.display().to_string().bold());
+    println!("  Time Taken   : {:.2}s", elapsed.as_secs_f64());
+
+    if extracted_path.join("metadata.yaml").exists() {
+        let _ = handle_info(&extracted_path);
+    }
+
+    Ok(())
+}
+
+fn handle_play(target_opt: Option<PathBuf>, ros2_args: Vec<String>) -> Result<()> {
+    let target = if let Some(t) = target_opt {
+        t
+    } else {
+        // Find latest archive or bag
+        if let Ok(archive) = resolve_archive_path(None) {
+            archive
+        } else {
+            resolve_bag_path(None)?
+        }
+    };
+
+    let bag_dir = if target.is_file() {
+        let name = target.file_name().unwrap_or_default().to_string_lossy();
+        if name.ends_with(".tar.zst") || name.ends_with(".tar.zstd") || name.ends_with(".zst") {
+            println!("{}", format!("Decompressing {} for immediate playback...", target.display()).cyan());
+            crate::compress::decompress_archive(&target, Path::new("."))?
+        } else {
+            target
+        }
+    } else {
+        target
+    };
+
+    println!("{}", format!("▶️ Playing bag: {}", bag_dir.display()).green().bold());
+
+    let mut cmd = Command::new("ros2");
+    cmd.arg("bag").arg("play").arg(&bag_dir);
+    cmd.args(&ros2_args);
+    cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+
+    let mut child = cmd.spawn().context("Failed to execute 'ros2 bag play'. Is ROS 2 sourced?")?;
+    let _status = child.wait().context("Failed to wait on ros2 bag play")?;
+
     Ok(())
 }
 

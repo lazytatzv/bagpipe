@@ -1,6 +1,6 @@
 # bagpipe (`bp`)
 
-Record, zstd-compress, and ship ROS 2 bags via **rsync** and/or **Discord** in one breath.
+Record, zstd-compress, ship, and unpack ROS 2 bags via **rsync** and/or **Discord** in one breath.
 
 ## Install
 
@@ -31,7 +31,16 @@ bp                    # auto-detect and ship latest bag
 bp ./my_rosbag_dir    # ship specific bag
 ```
 
-### 4. Inspect bag metadata
+### 4. Unpack & Play (Receiving side)
+
+```bash
+bp ./my_bag.tar.zst   # auto-extract archive & print summary
+bp unpack             # unpack latest .tar.zst in current directory
+bp play               # extract (if compressed) & play via `ros2 bag play`
+bp play --loop -r 2.0 # pass transparent args to `ros2 bag play`
+```
+
+### 5. Inspect bag metadata
 
 ```bash
 bp info               # print topics, messages, duration

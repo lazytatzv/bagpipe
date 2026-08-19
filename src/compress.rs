@@ -65,3 +65,40 @@ pub fn compress_bag_dir(bag_dir: &Path, output_path: &Path, zstd_level: i32) -> 
     let compressed_size = output_path.metadata()?.len();
     Ok(compressed_size)
 }
+
+/// Decompresses a .tar.zst archive or single zstd file into target directory.
+pub fn decompress_archive(archive_path: &Path, output_dir: &Path) -> Result<std::path::PathBuf> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
+    let buf_reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+
+    let decoder = zstd::stream::read::Decoder::new(buf_reader)
+        .context("Failed to initialize zstd decoder")?;
+
+    let filename = archive_path.file_name().unwrap_or_default().to_string_lossy();
+    if filename.ends_with(".tar.zst") || filename.ends_with(".tar.zstd") {
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(output_dir)
+            .with_context(|| format!("Failed to extract tar archive to {}", output_dir.display()))?;
+    } else {
+        // Single file extraction
+        let base_name = filename.trim_end_matches(".zst").trim_end_matches(".zstd");
+        let dest = output_dir.join(base_name);
+        let mut dest_file = File::create(&dest)?;
+        let mut dec = decoder;
+        std::io::copy(&mut dec, &mut dest_file)?;
+    }
+
+    // Try to find the extracted ROS 2 bag folder
+    if let Ok(entries) = std::fs::read_dir(output_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() && p.join("metadata.yaml").exists() {
+                return Ok(p);
+            }
+        }
+    }
+
+    Ok(output_dir.to_path_buf())
+}
+
