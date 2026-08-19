@@ -388,11 +388,11 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
         Some(ConfigAction::Get { key }) => match key.to_lowercase().as_str() {
             "webhook" | "webhook_url" => println!("{}", cfg.webhook_url.as_deref().unwrap_or("")),
             "discord" => println!("{}", if cfg.discord_enabled.unwrap_or(true) { "on" } else { "off" }),
-            "to" | "stream" | "host" => println!("{}", cfg.stream_target.as_deref().unwrap_or("")),
-            "stream_enabled" => println!("{}", if cfg.stream_enabled.unwrap_or(true) { "on" } else { "off" }),
+            "to" | "stream" | "host" | "send" => println!("{}", cfg.stream_target.as_deref().unwrap_or("")),
+            "stream_enabled" | "send_enabled" => println!("{}", if cfg.stream_enabled.unwrap_or(true) { "on" } else { "off" }),
             "max_size" | "max_size_mb" => println!("{}", cfg.max_file_size_mb.unwrap_or(25)),
             "zstd" | "zstd_level" => println!("{}", cfg.zstd_level.map(|l| l.to_string()).unwrap_or_else(|| "auto".to_string())),
-            other => anyhow::bail!("Unknown config key '{}'. Available keys: to, webhook, discord, stream, max_size, zstd", other),
+            other => anyhow::bail!("Unknown config key '{}'. Available keys: to, stream, discord, webhook, max_size, zstd", other),
         },
         Some(ConfigAction::Set { key, value }) => {
             let val_lower = value.to_lowercase();
@@ -412,8 +412,15 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
                         cfg.discord_enabled = Some(true);
                     }
                 }
-                "stream" => {
-                    cfg.stream_enabled = Some(matches!(val_lower.as_str(), "true" | "1" | "on" | "enable" | "yes"));
+                "stream" | "send" => {
+                    if val_lower == "off" || val_lower == "disable" || val_lower == "false" {
+                        cfg.stream_enabled = Some(false);
+                    } else if val_lower == "on" || val_lower == "enable" || val_lower == "true" {
+                        cfg.stream_enabled = Some(true);
+                    } else {
+                        cfg.stream_target = Some(value.clone());
+                        cfg.stream_enabled = Some(true);
+                    }
                 }
                 "to" | "host" => {
                     if val_lower == "off" || val_lower == "disable" || val_lower == "false" {

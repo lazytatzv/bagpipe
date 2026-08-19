@@ -53,13 +53,23 @@ bp webhook="https://discord.com/api/webhooks/..."
 bp discord=off / on    # toggle alerts
 ```
 
-## Configuration
+## Toggle & Configuration
 
 ```bash
+# Enable / disable streaming and Discord independently
+bp stream=off / on     # toggle direct network streaming
+bp discord=off / on    # toggle Discord webhook upload
+
+# Ad-hoc disable for a single run
+bp -a --no-stream      # record & compress, but don't stream
+bp -a --no-discord     # record & compress, but don't notify Discord
+
+# Check / customize settings
 bp config              # view all settings
 bp zstd=19             # set compression level (1-22 or auto)
 bp config reset        # reset to defaults
 ```
+
 
 ## License
 
