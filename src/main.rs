@@ -51,6 +51,14 @@ struct Cli {
     #[arg(short = 't', long = "to", value_name = "REMOTE_TARGET")]
     to: Option<String>,
 
+    /// Disable Discord notification/upload for this run
+    #[arg(long)]
+    no_discord: bool,
+
+    /// Disable rsync transfer for this run
+    #[arg(long)]
+    no_rsync: bool,
+
     /// Custom comment/note to include in Discord message
     #[arg(short = 'm', long = "message", value_name = "TEXT")]
     message: Option<String>,
@@ -81,6 +89,14 @@ enum Commands {
         #[arg(short = 't', long = "to", value_name = "REMOTE_TARGET")]
         to: Option<String>,
 
+        /// Disable Discord notification/upload for this run
+        #[arg(long)]
+        no_discord: bool,
+
+        /// Disable rsync transfer for this run
+        #[arg(long)]
+        no_rsync: bool,
+
         /// Keep compressed .tar.zst archive in output directory
         #[arg(short = 'k', long = "keep")]
         keep_archive: bool,
@@ -107,6 +123,14 @@ enum Commands {
         /// Remote rsync destination (e.g. `user@host:/path/to/bags`)
         #[arg(short = 't', long = "to", value_name = "REMOTE_TARGET")]
         to: Option<String>,
+
+        /// Disable Discord notification/upload for this run
+        #[arg(long)]
+        no_discord: bool,
+
+        /// Disable rsync transfer for this run
+        #[arg(long)]
+        no_rsync: bool,
 
         /// Keep compressed .tar.zst archive after sending
         #[arg(short = 'k', long = "keep")]
@@ -182,11 +206,19 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let rsync_target = cli.to.or_else(|| cfg.rsync_target.clone());
+    let rsync_target = if cli.no_rsync {
+        None
+    } else {
+        cli.to.or_else(|| {
+            if cfg.rsync_enabled.unwrap_or(true) { cfg.rsync_target.clone() } else { None }
+        })
+    };
+
+    let discord_active = !cli.no_discord && cfg.discord_enabled.unwrap_or(true);
 
     // 3. Handle explicit -f / --file
     if let Some(bag_path) = cli.file {
-        return handle_send(bag_path, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), &cfg).await;
+        return handle_send(bag_path, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), discord_active, &cfg).await;
     }
 
     // 4. Subcommands
@@ -199,14 +231,16 @@ async fn main() -> Result<()> {
                 let bag_path = resolve_bag_path(path)?;
                 return handle_info(&bag_path);
             }
-            Commands::Send { path, to, keep_archive, message, dry_run } => {
+            Commands::Send { path, to, no_discord, no_rsync, keep_archive, message, dry_run } => {
                 let bag_path = resolve_bag_path(path)?;
-                let target = to.or(rsync_target);
-                return handle_send(bag_path, keep_archive, message, dry_run, target.as_deref(), &cfg).await;
+                let target = if no_rsync { None } else { to.or(rsync_target) };
+                let send_discord = !no_discord && discord_active;
+                return handle_send(bag_path, keep_archive, message, dry_run, target.as_deref(), send_discord, &cfg).await;
             }
-            Commands::Record { output, to, keep_archive, message, dry_run, ros2_args } => {
-                let target = to.or(rsync_target);
-                return handle_record(output, keep_archive, message, dry_run, target.as_deref(), ros2_args, &cfg).await;
+            Commands::Record { output, to, no_discord, no_rsync, keep_archive, message, dry_run, ros2_args } => {
+                let target = if no_rsync { None } else { to.or(rsync_target) };
+                let send_discord = !no_discord && discord_active;
+                return handle_record(output, keep_archive, message, dry_run, target.as_deref(), send_discord, ros2_args, &cfg).await;
             }
         }
     }
@@ -215,15 +249,15 @@ async fn main() -> Result<()> {
     if cli.raw_args.is_empty() {
         let latest = find_latest_bag_in_dir(Path::new("."))?;
         println!("{}", format!("🔍 Detected latest bag in current directory: {}", latest.display()).bold().cyan());
-        return handle_send(latest, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), &cfg).await;
+        return handle_send(latest, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), discord_active, &cfg).await;
     }
 
-    // Check if raw_arg is a direct key=value config setting (e.g. `bp rsync=user@host:/bags` or `bp webhook=https://...`)
+    // Check if raw_arg is a direct key=value config setting (e.g. `bp rsync=user@host:/bags` or `bp discord=off`)
     if cli.raw_args.len() == 1 && cli.raw_args[0].contains('=') && !cli.raw_args[0].starts_with('/') && !cli.raw_args[0].starts_with('.') {
         let parts: Vec<&str> = cli.raw_args[0].splitn(2, '=').collect();
         let key = parts[0];
         let val = parts[1];
-        if matches!(key.to_lowercase().as_str(), "webhook" | "rsync" | "to" | "max_size" | "zstd") {
+        if matches!(key.to_lowercase().as_str(), "webhook" | "discord" | "rsync" | "to" | "max_size" | "zstd") {
             return handle_config_action(Some(ConfigAction::Set { key: key.to_string(), value: val.to_string() }), &mut cfg);
         }
     }
@@ -234,17 +268,29 @@ async fn main() -> Result<()> {
     if (first_path.exists() && (first_path.is_dir() || first_arg.ends_with(".db3") || first_arg.ends_with(".mcap")))
         && cli.raw_args.len() == 1
     {
-        return handle_send(first_path, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), &cfg).await;
+        return handle_send(first_path, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), discord_active, &cfg).await;
     }
 
-    handle_record(None, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), cli.raw_args, &cfg).await
+    handle_record(None, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), discord_active, cli.raw_args, &cfg).await
 }
 
 fn print_config(cfg: &Config) -> Result<()> {
+    let discord_status = match (&cfg.webhook_url, cfg.discord_enabled.unwrap_or(true)) {
+        (Some(url), true) => format!("Enabled ({})", url),
+        (Some(url), false) => format!("Disabled (URL: {})", url),
+        (None, _) => "(Not configured)".to_string(),
+    };
+
+    let rsync_status = match (&cfg.rsync_target, cfg.rsync_enabled.unwrap_or(true)) {
+        (Some(target), true) => format!("Enabled ({})", target),
+        (Some(target), false) => format!("Disabled (Target: {})", target),
+        (None, _) => "(Not configured)".to_string(),
+    };
+
     println!("{}", "Current bagpipe configuration:".bold().cyan());
     println!("  Config Path : {}", config::get_config_path()?.display());
-    println!("  Webhook URL : {}", cfg.webhook_url.as_deref().unwrap_or("(Not configured)"));
-    println!("  rsync Target: {}", cfg.rsync_target.as_deref().unwrap_or("(Not configured)"));
+    println!("  Discord     : {}", discord_status);
+    println!("  rsync       : {}", rsync_status);
     println!("  Max Upload  : {} MB", cfg.max_file_size_mb.unwrap_or(25));
     println!("  Zstd Level  : {}", cfg.zstd_level.map(|l| format!("Level {} (Manual)", l)).unwrap_or_else(|| "Auto-Tuned (Smart Adaptive)".to_string()));
     Ok(())
@@ -257,18 +303,42 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
         }
         Some(ConfigAction::Get { key }) => match key.to_lowercase().as_str() {
             "webhook" | "webhook_url" => println!("{}", cfg.webhook_url.as_deref().unwrap_or("")),
+            "discord" => println!("{}", if cfg.discord_enabled.unwrap_or(true) { "on" } else { "off" }),
             "rsync" | "rsync_target" | "to" => println!("{}", cfg.rsync_target.as_deref().unwrap_or("")),
+            "rsync_enabled" => println!("{}", if cfg.rsync_enabled.unwrap_or(true) { "on" } else { "off" }),
             "max_size" | "max_size_mb" => println!("{}", cfg.max_file_size_mb.unwrap_or(25)),
             "zstd" | "zstd_level" => println!("{}", cfg.zstd_level.map(|l| l.to_string()).unwrap_or_else(|| "auto".to_string())),
-            other => anyhow::bail!("Unknown config key '{}'. Available keys: webhook, rsync, max_size, zstd", other),
+            other => anyhow::bail!("Unknown config key '{}'. Available keys: webhook, discord, rsync, max_size, zstd", other),
         },
         Some(ConfigAction::Set { key, value }) => {
+            let val_lower = value.to_lowercase();
             match key.to_lowercase().as_str() {
+                "discord" => {
+                    cfg.discord_enabled = Some(matches!(val_lower.as_str(), "true" | "1" | "on" | "enable" | "yes"));
+                }
                 "webhook" | "webhook_url" => {
-                    cfg.webhook_url = if value.is_empty() || value == "null" || value == "none" { None } else { Some(value.clone()) };
+                    if val_lower == "off" || val_lower == "disable" || val_lower == "false" {
+                        cfg.discord_enabled = Some(false);
+                    } else if val_lower == "on" || val_lower == "enable" || val_lower == "true" {
+                        cfg.discord_enabled = Some(true);
+                    } else if value.is_empty() || value == "null" || value == "none" {
+                        cfg.webhook_url = None;
+                    } else {
+                        cfg.webhook_url = Some(value.clone());
+                        cfg.discord_enabled = Some(true);
+                    }
                 }
                 "rsync" | "rsync_target" | "to" => {
-                    cfg.rsync_target = if value.is_empty() || value == "null" || value == "none" { None } else { Some(value.clone()) };
+                    if val_lower == "off" || val_lower == "disable" || val_lower == "false" {
+                        cfg.rsync_enabled = Some(false);
+                    } else if val_lower == "on" || val_lower == "enable" || val_lower == "true" {
+                        cfg.rsync_enabled = Some(true);
+                    } else if value.is_empty() || value == "null" || value == "none" {
+                        cfg.rsync_target = None;
+                    } else {
+                        cfg.rsync_target = Some(value.clone());
+                        cfg.rsync_enabled = Some(true);
+                    }
                 }
                 "max_size" | "max_size_mb" => {
                     let mb: u64 = value.parse().context("max_size must be a positive integer (MB)")?;
@@ -285,7 +355,7 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
                         cfg.zstd_level = Some(lvl);
                     }
                 }
-                other => anyhow::bail!("Unknown config key '{}'. Available keys: webhook, rsync, max_size, zstd", other),
+                other => anyhow::bail!("Unknown config key '{}'. Available keys: webhook, discord, rsync, max_size, zstd", other),
             }
             save_config(cfg)?;
             println!("{}", format!("✓ Set {} = {}", key, value).green().bold());
@@ -366,6 +436,7 @@ async fn handle_record(
     custom_message: Option<String>,
     dry_run: bool,
     rsync_target: Option<&str>,
+    send_discord: bool,
     ros2_args: Vec<String>,
     cfg: &Config,
 ) -> Result<()> {
@@ -420,7 +491,7 @@ async fn handle_record(
     }
 
     // Process pipeline
-    handle_send(bag_path, keep_archive, custom_message, dry_run, rsync_target, cfg).await
+    handle_send(bag_path, keep_archive, custom_message, dry_run, rsync_target, send_discord, cfg).await
 }
 
 async fn handle_send(
@@ -429,6 +500,7 @@ async fn handle_send(
     custom_message: Option<String>,
     dry_run: bool,
     rsync_target: Option<&str>,
+    send_discord: bool,
     cfg: &Config,
 ) -> Result<()> {
     let pb = ProgressBar::new_spinner();
@@ -512,46 +584,48 @@ async fn handle_send(
         }
     }
 
-    // Handle Discord Webhook if configured
-    if let Some(webhook_url) = &cfg.webhook_url {
-        if !webhook_url.trim().is_empty() {
-            let upload_pb = ProgressBar::new_spinner();
-            upload_pb.set_style(
-                ProgressStyle::default_spinner()
-                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
-                    .template("{spinner:.cyan} {msg}")?,
-            );
-            upload_pb.enable_steady_tick(std::time::Duration::from_millis(80));
-            upload_pb.set_message("Uploading report to Discord...");
+    // Handle Discord Webhook if enabled and configured
+    if send_discord {
+        if let Some(webhook_url) = &cfg.webhook_url {
+            if !webhook_url.trim().is_empty() {
+                let upload_pb = ProgressBar::new_spinner();
+                upload_pb.set_style(
+                    ProgressStyle::default_spinner()
+                        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
+                        .template("{spinner:.cyan} {msg}")?,
+                );
+                upload_pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                upload_pb.set_message("Uploading report to Discord...");
 
-            let synced_str = if rsync_successful { rsync_target } else { None };
+                let synced_str = if rsync_successful { rsync_target } else { None };
 
-            let res = send_to_discord(
-                webhook_url.trim(),
-                &summary,
-                Some(&archive_path),
-                raw_size,
-                Some(compressed_size),
-                max_mb,
-                custom_message.as_deref(),
-                synced_str,
-            ).await;
+                let res = send_to_discord(
+                    webhook_url.trim(),
+                    &summary,
+                    Some(&archive_path),
+                    raw_size,
+                    Some(compressed_size),
+                    max_mb,
+                    custom_message.as_deref(),
+                    synced_str,
+                ).await;
 
-            upload_pb.finish_and_clear();
+                upload_pb.finish_and_clear();
 
-            match res {
-                Ok(()) => {
-                    println!("{}", "Successfully sent report to Discord!".green().bold());
-                }
-                Err(e) => {
-                    eprintln!("{} Failed to send to Discord: {:?}", "✗".red().bold(), e);
+                match res {
+                    Ok(()) => {
+                        println!("{}", "Successfully sent report to Discord!".green().bold());
+                    }
+                    Err(e) => {
+                        eprintln!("{} Failed to send to Discord: {:?}", "✗".red().bold(), e);
+                    }
                 }
             }
         }
     } else if rsync_target.is_none() {
-        println!("\n{}", "No remote destination configured!".yellow().bold());
-        println!("Configure Discord Webhook with: {}", "bp --init <URL>".cyan());
-        println!("Or sync to remote PC with:       {}", "bp --to user@host:/path".cyan());
+        println!("\n{}", "No remote destination active!".yellow().bold());
+        println!("Enable Discord with: {}", "bp discord=on".cyan());
+        println!("Or enable rsync with: {}", "bp rsync=on".cyan());
     }
 
     if !keep_archive && archive_path.exists() && rsync_target.is_none() {
@@ -560,4 +634,5 @@ async fn handle_send(
 
     Ok(())
 }
+
 

@@ -37,12 +37,21 @@ bp ./my_rosbag_dir    # ship specific bag
 bp info               # print topics, messages, duration
 ```
 
-## Configuration
+## Toggle & Configuration
 
 ```bash
-bp config             # show current settings
+# Enable / disable destinations
+bp discord=on / off
+bp rsync=on / off
+
+# Ad-hoc disable for a single run
+bp -a --no-discord
+bp -a --no-rsync
+
+# Check / customize settings
+bp config
 bp zstd=19            # manual compression level (1-22 or auto)
-bp config reset       # reset to defaults
+bp config reset
 ```
 
 ## License
