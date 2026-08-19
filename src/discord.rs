@@ -14,6 +14,7 @@ pub async fn send_to_discord(
     compressed_size_bytes: Option<u64>,
     max_upload_size_mb: u64,
     custom_comment: Option<&str>,
+    remote_synced_target: Option<&str>,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -28,6 +29,9 @@ pub async fn send_to_discord(
     let mut description = String::new();
     if let Some(comment) = custom_comment {
         description.push_str(&format!("**Note:** {}\n\n", comment));
+    }
+    if let Some(target) = remote_synced_target {
+        description.push_str(&format!("🚀 **Synced to:** `{}`\n\n", target));
     }
     description.push_str(&format!("**Bag Name:** `{}`\n", bag_summary.bag_name));
     description.push_str(&format!("**Storage:** `{}` | **Messages:** `{}`\n", bag_summary.storage_format, bag_summary.message_count));

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub webhook_url: Option<String>,
+    pub rsync_target: Option<String>, // e.g. "user@server:/path/to/bags"
     pub max_file_size_mb: Option<u64>,
     pub zstd_level: Option<i32>,
 }
@@ -14,6 +15,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             webhook_url: None,
+            rsync_target: None,
             max_file_size_mb: Some(25), // Discord standard max upload size
             zstd_level: None,           // None = Smart Adaptive Auto-Tuning
         }

@@ -2,6 +2,7 @@ mod bag_meta;
 mod compress;
 mod config;
 mod discord;
+mod rsync;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -16,14 +17,15 @@ use crate::bag_meta::parse_bag_metadata;
 use crate::compress::compress_bag_dir;
 use crate::config::{load_config, save_config, Config};
 use crate::discord::send_to_discord;
+use crate::rsync::sync_to_remote;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "bagpipe",
     author = "lazytatzv",
     version = "0.1.0",
-    about = "🚀 Record, zstd compress, summarize & ship ROS 2 bags to Discord",
-    long_about = "bagpipe (bp / rosbag-pipe) - The ultimate ROS 2 bag pipeline tool.\n\nUltra-ergonomic usage:\n  bp                     # Auto-send the latest recorded rosbag in current directory\n  bp ./my_bag            # Auto-detect & send existing bag\n  bp -a                  # Auto-infer `record -a`\n  bp /topic1 /topic2     # Auto-infer `record /topic1 /topic2`\n  bp --init <URL>        # Quick Webhook setup"
+    about = "Record, zstd compress, summarize & ship ROS 2 bags via Discord or rsync",
+    long_about = "bagpipe (bp / rosbag-pipe) - The ultimate ROS 2 bag pipeline tool.\n\nUltra-ergonomic usage:\n  bp                     # Auto-ship latest recorded rosbag in current directory\n  bp ./my_bag            # Auto-detect & ship existing bag\n  bp -a                  # Auto-infer `record -a`\n  bp /topic1 /topic2     # Auto-infer `record /topic1 /topic2`\n  bp --to user@host:/dir # Ship via rsync directly to remote machine\n  bp --init <URL>        # Quick Webhook setup"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,6 +35,10 @@ struct Cli {
     #[arg(long, value_name = "URL")]
     init: Option<String>,
 
+    /// Set default remote rsync target (e.g. `bp --init-rsync user@host:/path/to/bags`)
+    #[arg(long, value_name = "TARGET")]
+    init_rsync: Option<String>,
+
     /// Show current configuration
     #[arg(long)]
     config: bool,
@@ -40,6 +46,10 @@ struct Cli {
     /// Direct upload of an existing bag (shorthand for `bp send <PATH>`)
     #[arg(short = 'f', long = "file", value_name = "BAG_PATH")]
     file: Option<PathBuf>,
+
+    /// Send to remote machine using rsync (e.g. `bp --to user@server:/bags` or `bp -t server:/bags`)
+    #[arg(short = 't', long = "to", value_name = "REMOTE_TARGET")]
+    to: Option<String>,
 
     /// Custom comment/note to include in Discord message
     #[arg(short = 'm', long = "message", value_name = "TEXT")]
@@ -49,7 +59,7 @@ struct Cli {
     #[arg(short = 'k', long = "keep")]
     keep_archive: bool,
 
-    /// Dry-run mode (parse & compress, but skip Discord upload)
+    /// Dry-run mode (parse & compress, but skip network upload/sync)
     #[arg(long)]
     dry_run: bool,
 
@@ -60,12 +70,16 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Record a ROS 2 bag and automatically compress & upload on stop (Ctrl+C)
+    /// Record a ROS 2 bag and automatically compress & upload/sync on stop (Ctrl+C)
     #[command(trailing_var_arg = true, allow_hyphen_values = true)]
     Record {
         /// Optional bag output directory name (-o/--output flag or custom path)
         #[arg(short = 'o', long = "output", value_name = "OUTPUT_DIR")]
         output: Option<String>,
+
+        /// Remote rsync destination (e.g. `user@host:/path/to/bags`)
+        #[arg(short = 't', long = "to", value_name = "REMOTE_TARGET")]
+        to: Option<String>,
 
         /// Keep compressed .tar.zst archive in output directory
         #[arg(short = 'k', long = "keep")]
@@ -84,11 +98,15 @@ enum Commands {
         ros2_args: Vec<String>,
     },
 
-    /// Compress and upload an existing ROS 2 bag directory or file
+    /// Compress and upload/sync an existing ROS 2 bag directory or file
     Send {
         /// Path to ROS 2 bag folder or database file (defaults to latest in current directory)
         #[arg(value_name = "BAG_PATH")]
         path: Option<PathBuf>,
+
+        /// Remote rsync destination (e.g. `user@host:/path/to/bags`)
+        #[arg(short = 't', long = "to", value_name = "REMOTE_TARGET")]
+        to: Option<String>,
 
         /// Keep compressed .tar.zst archive after sending
         #[arg(short = 'k', long = "keep")]
@@ -98,17 +116,22 @@ enum Commands {
         #[arg(short = 'm', long = "message", value_name = "TEXT")]
         message: Option<String>,
 
-        /// Dry-run mode (parse & compress, but do not send to Discord)
+        /// Dry-run mode (parse & compress, but do not send)
         #[arg(long)]
         dry_run: bool,
     },
 
-    /// Initialize or update Discord Webhook configuration
+    /// Initialize or update configuration (Discord Webhook / rsync target)
     Init {
         /// Discord Webhook URL
-        webhook_url: String,
+        #[arg(long)]
+        webhook: Option<String>,
 
-        /// Max upload file size in MB (default: 25)
+        /// Remote rsync destination (e.g. `user@host:/path/to/bags`)
+        #[arg(long)]
+        rsync: Option<String>,
+
+        /// Max upload file size in MB for Discord (default: 25)
         #[arg(long, default_value = "25")]
         max_size_mb: u64,
     },
@@ -129,8 +152,16 @@ async fn main() -> Result<()> {
     if let Some(webhook) = cli.init {
         cfg.webhook_url = Some(webhook.clone());
         save_config(&cfg)?;
-        println!("{}", "✓ Configuration updated successfully!".green().bold());
+        println!("{}", "✓ Discord Webhook configured!".green().bold());
         println!("  Webhook URL: {}", webhook);
+        return Ok(());
+    }
+
+    if let Some(rsync_target) = cli.init_rsync {
+        cfg.rsync_target = Some(rsync_target.clone());
+        save_config(&cfg)?;
+        println!("{}", "✓ Remote rsync target configured!".green().bold());
+        println!("  rsync target: {}", rsync_target);
         return Ok(());
     }
 
@@ -139,65 +170,69 @@ async fn main() -> Result<()> {
         println!("{}", "⚙️  Current bagpipe configuration:".bold().cyan());
         println!("  Config Path : {}", config::get_config_path()?.display());
         println!("  Webhook URL : {}", cfg.webhook_url.as_deref().unwrap_or("(Not configured)"));
+        println!("  rsync Target: {}", cfg.rsync_target.as_deref().unwrap_or("(Not configured)"));
         println!("  Max Upload  : {} MB", cfg.max_file_size_mb.unwrap_or(25));
-        println!("  Zstd Level  : {}", cfg.zstd_level.unwrap_or(3));
+        println!("  Zstd Level  : {}", cfg.zstd_level.map(|l| l.to_string()).unwrap_or_else(|| "Auto-Tuned".to_string()));
         return Ok(());
     }
 
+    let rsync_target = cli.to.or_else(|| cfg.rsync_target.clone());
+
     // 3. Handle explicit -f / --file
     if let Some(bag_path) = cli.file {
-        return handle_send(bag_path, cli.keep_archive, cli.message, cli.dry_run, &cfg).await;
+        return handle_send(bag_path, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), &cfg).await;
     }
 
     // 4. Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
-            Commands::Init { webhook_url, max_size_mb } => {
-                cfg.webhook_url = Some(webhook_url.clone());
+            Commands::Init { webhook, rsync, max_size_mb } => {
+                if let Some(w) = webhook {
+                    cfg.webhook_url = Some(w);
+                }
+                if let Some(r) = rsync {
+                    cfg.rsync_target = Some(r);
+                }
                 cfg.max_file_size_mb = Some(max_size_mb);
                 save_config(&cfg)?;
                 println!("{}", "✓ Configuration saved!".green().bold());
-                println!("  Webhook URL : {}", webhook_url);
-                println!("  Max Size    : {} MB", max_size_mb);
+                if let Some(w) = &cfg.webhook_url { println!("  Webhook URL : {}", w); }
+                if let Some(r) = &cfg.rsync_target { println!("  rsync Target: {}", r); }
                 return Ok(());
             }
             Commands::Info { path } => {
                 let bag_path = resolve_bag_path(path)?;
                 return handle_info(&bag_path);
             }
-            Commands::Send { path, keep_archive, message, dry_run } => {
+            Commands::Send { path, to, keep_archive, message, dry_run } => {
                 let bag_path = resolve_bag_path(path)?;
-                return handle_send(bag_path, keep_archive, message, dry_run, &cfg).await;
+                let target = to.or(rsync_target);
+                return handle_send(bag_path, keep_archive, message, dry_run, target.as_deref(), &cfg).await;
             }
-            Commands::Record { output, keep_archive, message, dry_run, ros2_args } => {
-                return handle_record(output, keep_archive, message, dry_run, ros2_args, &cfg).await;
+            Commands::Record { output, to, keep_archive, message, dry_run, ros2_args } => {
+                let target = to.or(rsync_target);
+                return handle_record(output, keep_archive, message, dry_run, target.as_deref(), ros2_args, &cfg).await;
             }
         }
     }
 
     // 5. Smart Raw Args Auto-Inference:
-    // If no subcommand is specified, intelligently decide what the user wants:
-    // Case A: `bp` (no args) -> Find and send latest bag in current dir
-    // Case B: `bp path/to/bag` -> Send that bag
-    // Case C: `bp -a` or `bp /topic1` -> Record and send
     if cli.raw_args.is_empty() {
         let latest = find_latest_bag_in_dir(Path::new("."))?;
         println!("{}", format!("🔍 Detected latest bag in current directory: {}", latest.display()).bold().cyan());
-        return handle_send(latest, cli.keep_archive, cli.message, cli.dry_run, &cfg).await;
+        return handle_send(latest, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), &cfg).await;
     }
 
-    // Check if first arg is an existing directory/file or starts with '-' / '/'
     let first_arg = &cli.raw_args[0];
     let first_path = PathBuf::from(first_arg);
 
     if (first_path.exists() && (first_path.is_dir() || first_arg.ends_with(".db3") || first_arg.ends_with(".mcap")))
         && cli.raw_args.len() == 1
     {
-        return handle_send(first_path, cli.keep_archive, cli.message, cli.dry_run, &cfg).await;
+        return handle_send(first_path, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), &cfg).await;
     }
 
-    // Otherwise, treat all raw_args as arguments to `record` (e.g. `bp -a`, `bp /tf /scan`)
-    handle_record(None, cli.keep_archive, cli.message, cli.dry_run, cli.raw_args, &cfg).await
+    handle_record(None, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), cli.raw_args, &cfg).await
 }
 
 fn resolve_bag_path(path_opt: Option<PathBuf>) -> Result<PathBuf> {
@@ -254,6 +289,7 @@ async fn handle_record(
     keep_archive: bool,
     custom_message: Option<String>,
     dry_run: bool,
+    rsync_target: Option<&str>,
     ros2_args: Vec<String>,
     cfg: &Config,
 ) -> Result<()> {
@@ -275,9 +311,9 @@ async fn handle_record(
         })
     };
 
-    println!("{}", "🎥 Starting ROS 2 bag recording...".green().bold());
+    println!("{}", "Starting ROS 2 bag recording...".green().bold());
     println!("   Output Directory : {}", bag_output_dir.bold());
-    println!("   (Press {} to stop recording and start compression/upload)", "Ctrl+C".yellow().bold());
+    println!("   (Press {} to stop recording and start compression/pipeline)", "Ctrl+C".yellow().bold());
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -300,7 +336,7 @@ async fn handle_record(
     let mut child = cmd.spawn().context("Failed to execute 'ros2 bag record'. Is ROS 2 sourced?")?;
 
     let _status = child.wait().context("Failed to wait on ros2 process")?;
-    println!("\n{}", "🛑 Recording finished.".yellow().bold());
+    println!("\n{}", "Recording finished.".yellow().bold());
 
     let bag_path = PathBuf::from(&bag_output_dir);
     if !bag_path.exists() {
@@ -308,7 +344,7 @@ async fn handle_record(
     }
 
     // Process pipeline
-    handle_send(bag_path, keep_archive, custom_message, dry_run, cfg).await
+    handle_send(bag_path, keep_archive, custom_message, dry_run, rsync_target, cfg).await
 }
 
 async fn handle_send(
@@ -316,6 +352,7 @@ async fn handle_send(
     keep_archive: bool,
     custom_message: Option<String>,
     dry_run: bool,
+    rsync_target: Option<&str>,
     cfg: &Config,
 ) -> Result<()> {
     let pb = ProgressBar::new_spinner();
@@ -332,7 +369,7 @@ async fn handle_send(
 
     let raw_size = summary.total_raw_size_bytes;
     let archive_name = format!("{}.tar.zst", summary.bag_name);
-    let archive_path = if keep_archive {
+    let archive_path = if keep_archive || rsync_target.is_some() {
         summary.bag_path.parent().unwrap_or_else(|| Path::new(".")).join(&archive_name)
     } else {
         std::env::temp_dir().join(&archive_name)
@@ -351,7 +388,7 @@ async fn handle_send(
     let mut compressed_size = compress_bag_dir(&summary.bag_path, &archive_path, zstd_level)
         .with_context(|| format!("Failed to compress bag directory to {}", archive_path.display()))?;
 
-    // If compressed size is slightly over the Discord limit (<= 1.3x limit), re-compress at max level (19)
+    // If compressed size is slightly over the Discord limit (<= 1.35x limit), re-compress at max level (19)
     if compressed_size > max_bytes && compressed_size <= (max_bytes as f64 * 1.35) as u64 && zstd_level < 19 && cfg.zstd_level.is_none() {
         pb.set_message("Size close to limit: re-compressing with Ultra zstd (Level 19) to fit Discord...".to_string());
         zstd_level = 19;
@@ -371,7 +408,7 @@ async fn handle_send(
 
     pb.finish_and_clear();
 
-    println!("{}", "✨ Compression Complete!".green().bold());
+    println!("{}", "Compression Complete!".green().bold());
     println!("  Original Size : {}", human_bytes::human_bytes(raw_size as f64).cyan());
     println!("  Compressed    : {}", human_bytes::human_bytes(compressed_size as f64).green().bold());
     println!("  Ratio         : {:.1}% (in {:.2}s, zstd: L{} {})", ratio, comp_elapsed.as_secs_f64(), zstd_level, mode_desc.dimmed());
@@ -380,53 +417,71 @@ async fn handle_send(
     }
 
     if dry_run {
-        println!("{}", "⚡ Dry-run enabled: skipped Discord upload.".yellow());
+        println!("{}", "Dry-run enabled: skipped network upload and rsync.".yellow());
         return Ok(());
     }
 
-    let webhook_url = match &cfg.webhook_url {
-        Some(url) if !url.trim().is_empty() => url.trim(),
-        _ => {
-            println!("\n{}", "⚠️  No Discord Webhook URL configured!".yellow().bold());
-            println!("Run {} to configure Webhook, or set WEBHOOK_URL.", "bp init <WEBHOOK_URL>".cyan());
-            return Ok(());
+    // Handle rsync transfer if target specified
+    let mut rsync_successful = false;
+    if let Some(target) = rsync_target {
+        println!("\n{}", format!("Transmitting archive via rsync to {}...", target).bold().cyan());
+        match sync_to_remote(&archive_path, target) {
+            Ok(()) => {
+                println!("{}", "Successfully synced to remote target via rsync!".green().bold());
+                rsync_successful = true;
+            }
+            Err(e) => {
+                eprintln!("{} Failed to rsync: {:?}", "✗".red().bold(), e);
+            }
         }
-    };
-
-    let max_mb = cfg.max_file_size_mb.unwrap_or(25);
-    let upload_pb = ProgressBar::new_spinner();
-    upload_pb.set_style(
-        ProgressStyle::default_spinner()
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
-            .template("{spinner:.cyan} {msg}")?,
-    );
-    upload_pb.enable_steady_tick(std::time::Duration::from_millis(80));
-    upload_pb.set_message("Uploading report to Discord...");
-
-    let res = send_to_discord(
-        webhook_url,
-        &summary,
-        Some(&archive_path),
-        raw_size,
-        Some(compressed_size),
-        max_mb,
-        custom_message.as_deref(),
-    ).await;
-
-    if !keep_archive && archive_path.exists() {
-        let _ = std::fs::remove_file(&archive_path);
     }
 
-    upload_pb.finish_and_clear();
+    // Handle Discord Webhook if configured
+    if let Some(webhook_url) = &cfg.webhook_url {
+        if !webhook_url.trim().is_empty() {
+            let upload_pb = ProgressBar::new_spinner();
+            upload_pb.set_style(
+                ProgressStyle::default_spinner()
+                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
+                    .template("{spinner:.cyan} {msg}")?,
+            );
+            upload_pb.enable_steady_tick(std::time::Duration::from_millis(80));
+            upload_pb.set_message("Uploading report to Discord...");
 
-    match res {
-        Ok(()) => {
-            println!("{}", "🚀 Successfully sent to Discord!".green().bold());
+            let synced_str = if rsync_successful { rsync_target } else { None };
+
+            let res = send_to_discord(
+                webhook_url.trim(),
+                &summary,
+                Some(&archive_path),
+                raw_size,
+                Some(compressed_size),
+                max_mb,
+                custom_message.as_deref(),
+                synced_str,
+            ).await;
+
+            upload_pb.finish_and_clear();
+
+            match res {
+                Ok(()) => {
+                    println!("{}", "Successfully sent report to Discord!".green().bold());
+                }
+                Err(e) => {
+                    eprintln!("{} Failed to send to Discord: {:?}", "✗".red().bold(), e);
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("{} Failed to send to Discord: {:?}", "✗".red().bold(), e);
-        }
+    } else if rsync_target.is_none() {
+        println!("\n{}", "No remote destination configured!".yellow().bold());
+        println!("Configure Discord Webhook with: {}", "bp --init <URL>".cyan());
+        println!("Or sync to remote PC with:       {}", "bp --to user@host:/path".cyan());
+    }
+
+    if !keep_archive && archive_path.exists() && rsync_target.is_none() {
+        let _ = std::fs::remove_file(&archive_path);
     }
 
     Ok(())
 }
+
