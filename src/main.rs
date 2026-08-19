@@ -2,7 +2,6 @@ mod bag_meta;
 mod compress;
 mod config;
 mod discord;
-mod rsync;
 mod stream;
 
 #[global_allocator]
@@ -21,16 +20,15 @@ use crate::bag_meta::parse_bag_metadata;
 use crate::compress::compress_bag_dir;
 use crate::config::{load_config, save_config, Config};
 use crate::discord::send_to_discord;
-use crate::rsync::sync_to_remote;
-use crate::stream::{receive_stream, send_direct_stream};
+use crate::stream::send_direct_stream;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "bagpipe",
     author = "lazytatzv",
     version = "0.1.0",
-    about = "Record, zstd compress, summarize & ship ROS 2 bags via Discord or rsync",
-    long_about = "bagpipe (bp / rosbag-pipe) - The ultimate ROS 2 bag pipeline tool.\n\nUltra-ergonomic usage:\n  bp                     # Auto-ship latest recorded rosbag in current directory\n  bp ./my_bag            # Auto-detect & ship existing bag\n  bp -a                  # Auto-infer `record -a`\n  bp /topic1 /topic2     # Auto-infer `record /topic1 /topic2`\n  bp --to user@host:/dir # Ship via rsync directly to remote machine\n  bp --init <URL>        # Quick Webhook setup"
+    about = "Record, zstd-compress, and ship ROS 2 bags at wire-speed",
+    long_about = "bagpipe (bp) - The ultimate ROS 2 bag pipeline tool.\n\nUltra-ergonomic usage:\n  bp                     # Auto-ship latest recorded rosbag in current directory\n  bp ./my_bag            # Auto-detect & ship existing bag\n  bp -a                  # Auto-infer `record -a`\n  bp -t my-desktop       # Stream directly to receiver (LAN / Tailscale)\n  bp listen              # Receive incoming streams & auto-extract\n  bp play                # Extract & play bag with `ros2 bag play`"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,29 +38,25 @@ struct Cli {
     #[arg(long, value_name = "URL")]
     init: Option<String>,
 
-    /// Set default remote rsync target (e.g. `bp --init-rsync user@host:/path/to/bags`)
-    #[arg(long, value_name = "TARGET")]
-    init_rsync: Option<String>,
-
     /// Show current configuration
     #[arg(long)]
     config: bool,
 
-    /// Direct upload of an existing bag (shorthand for `bp send <PATH>`)
+    /// Direct upload/stream of an existing bag (shorthand for `bp send <PATH>`)
     #[arg(short = 'f', long = "file", value_name = "BAG_PATH")]
     file: Option<PathBuf>,
 
-    /// Send to remote machine using rsync (e.g. `bp --to user@server:/bags` or `bp -t server:/bags`)
-    #[arg(short = 't', long = "to", value_name = "REMOTE_TARGET")]
+    /// Stream target host/IP (e.g. `bp -t my-desktop` or `bp -t 100.64.0.12`)
+    #[arg(short = 't', long = "to", value_name = "HOST")]
     to: Option<String>,
 
     /// Disable Discord notification/upload for this run
     #[arg(long)]
     no_discord: bool,
 
-    /// Disable rsync transfer for this run
+    /// Disable direct stream transfer for this run
     #[arg(long)]
-    no_rsync: bool,
+    no_stream: bool,
 
     /// Custom comment/note to include in Discord message
     #[arg(short = 'm', long = "message", value_name = "TEXT")]
@@ -72,7 +66,7 @@ struct Cli {
     #[arg(short = 'k', long = "keep")]
     keep_archive: bool,
 
-    /// Dry-run mode (parse & compress, but skip network upload/sync)
+    /// Dry-run mode (parse & compress, but skip network transfer)
     #[arg(long)]
     dry_run: bool,
 
@@ -83,24 +77,24 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Record a ROS 2 bag and automatically compress & upload/sync on stop (Ctrl+C)
+    /// Record a ROS 2 bag and automatically compress & stream/notify on stop (Ctrl+C)
     #[command(trailing_var_arg = true, allow_hyphen_values = true)]
     Record {
         /// Optional bag output directory name (-o/--output flag or custom path)
         #[arg(short = 'o', long = "output", value_name = "OUTPUT_DIR")]
         output: Option<String>,
 
-        /// Remote rsync destination (e.g. `user@host:/path/to/bags`)
-        #[arg(short = 't', long = "to", value_name = "REMOTE_TARGET")]
+        /// Stream target host/IP (e.g. `my-desktop` or `100.64.0.12`)
+        #[arg(short = 't', long = "to", value_name = "HOST")]
         to: Option<String>,
 
         /// Disable Discord notification/upload for this run
         #[arg(long)]
         no_discord: bool,
 
-        /// Disable rsync transfer for this run
+        /// Disable stream transfer for this run
         #[arg(long)]
-        no_rsync: bool,
+        no_stream: bool,
 
         /// Keep compressed .tar.zst archive in output directory
         #[arg(short = 'k', long = "keep")]
@@ -119,23 +113,23 @@ enum Commands {
         ros2_args: Vec<String>,
     },
 
-    /// Compress and upload/sync an existing ROS 2 bag directory or file
+    /// Compress and stream/notify an existing ROS 2 bag directory or file
     Send {
         /// Path to ROS 2 bag folder or database file (defaults to latest in current directory)
         #[arg(value_name = "BAG_PATH")]
         path: Option<PathBuf>,
 
-        /// Remote rsync destination (e.g. `user@host:/path/to/bags`)
-        #[arg(short = 't', long = "to", value_name = "REMOTE_TARGET")]
+        /// Stream target host/IP (e.g. `my-desktop` or `100.64.0.12`)
+        #[arg(short = 't', long = "to", value_name = "HOST")]
         to: Option<String>,
 
         /// Disable Discord notification/upload for this run
         #[arg(long)]
         no_discord: bool,
 
-        /// Disable rsync transfer for this run
+        /// Disable stream transfer for this run
         #[arg(long)]
-        no_rsync: bool,
+        no_stream: bool,
 
         /// Keep compressed .tar.zst archive after sending
         #[arg(short = 'k', long = "keep")]
@@ -150,8 +144,11 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Listen for incoming direct high-speed streams (bypasses SSH for max line-rate)
-    Listen {
+    /// Run bag receiver server (foreground or background daemon)
+    Server {
+        #[command(subcommand)]
+        action: Option<ServerAction>,
+
         /// Port to listen on (default: 8990)
         #[arg(short = 'p', long = "port", default_value = "8990")]
         port: u16,
@@ -163,6 +160,10 @@ enum Commands {
         /// Automatically play bag with `ros2 bag play` immediately after receiving
         #[arg(long)]
         play: bool,
+
+        /// Run in background (daemon mode)
+        #[arg(short = 'd', long = "daemon")]
+        daemon: bool,
     },
 
     /// Unpack / extract a compressed bag archive (.tar.zst)
@@ -199,15 +200,33 @@ enum Commands {
 }
 
 #[derive(Subcommand, Debug)]
+enum ServerAction {
+    /// Start server in background
+    Start {
+        /// Port to listen on (default: 8990)
+        #[arg(short = 'p', long = "port", default_value = "8990")]
+        port: u16,
+
+        /// Automatically play bag with `ros2 bag play` immediately after receiving
+        #[arg(long)]
+        play: bool,
+    },
+    /// Stop running background server
+    Stop,
+    /// Check background server status
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
 enum ConfigAction {
     /// Get a specific configuration key
     Get {
-        /// Key name (webhook, rsync, max_size, zstd)
+        /// Key name (webhook, to, stream, max_size, zstd)
         key: String,
     },
     /// Set a specific configuration key
     Set {
-        /// Key name (webhook, rsync, max_size, zstd)
+        /// Key name (webhook, to, stream, max_size, zstd)
         key: String,
         /// Value to set (use "null" or "auto" for zstd)
         value: String,
@@ -232,25 +251,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(rsync_target) = cli.init_rsync {
-        cfg.rsync_target = Some(rsync_target.clone());
-        save_config(&cfg)?;
-        println!("{}", "✓ Remote rsync target configured!".green().bold());
-        println!("  rsync target: {}", rsync_target);
-        return Ok(());
-    }
-
     // 2. Handle --config
     if cli.config {
         print_config(&cfg)?;
         return Ok(());
     }
 
-    let rsync_target = if cli.no_rsync {
+    let stream_target = if cli.no_stream {
         None
     } else {
         cli.to.or_else(|| {
-            if cfg.rsync_enabled.unwrap_or(true) { cfg.rsync_target.clone() } else { None }
+            if cfg.stream_enabled.unwrap_or(true) { cfg.stream_target.clone() } else { None }
         })
     };
 
@@ -258,15 +269,31 @@ async fn main() -> Result<()> {
 
     // 3. Handle explicit -f / --file
     if let Some(bag_path) = cli.file {
-        return handle_send(bag_path, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), discord_active, &cfg).await;
+        return handle_send(bag_path, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, &cfg).await;
     }
 
     // 4. Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
-            Commands::Listen { port, unpack, play } => {
-                receive_stream(port, unpack, play).await?;
-                return Ok(());
+            Commands::Server { action, port, unpack, play, daemon } => {
+                match action {
+                    Some(ServerAction::Start { port, play }) => {
+                        return stream::start_daemon(port, play);
+                    }
+                    Some(ServerAction::Stop) => {
+                        return stream::stop_daemon();
+                    }
+                    Some(ServerAction::Status) => {
+                        return stream::status_daemon();
+                    }
+                    None => {
+                        if daemon {
+                            return stream::start_daemon(port, play);
+                        } else {
+                            return stream::run_server(port, unpack, play, true).await;
+                        }
+                    }
+                }
             }
             Commands::Unpack { archive, output } => {
                 let archive_path = resolve_archive_path(archive)?;
@@ -283,14 +310,14 @@ async fn main() -> Result<()> {
                 let bag_path = resolve_bag_path(path)?;
                 return handle_info(&bag_path);
             }
-            Commands::Send { path, to, no_discord, no_rsync, keep_archive, message, dry_run } => {
+            Commands::Send { path, to, no_discord, no_stream, keep_archive, message, dry_run } => {
                 let bag_path = resolve_bag_path(path)?;
-                let target = if no_rsync { None } else { to.or(rsync_target) };
+                let target = if no_stream { None } else { to.or(stream_target) };
                 let send_discord = !no_discord && discord_active;
                 return handle_send(bag_path, keep_archive, message, dry_run, target.as_deref(), send_discord, &cfg).await;
             }
-            Commands::Record { output, to, no_discord, no_rsync, keep_archive, message, dry_run, ros2_args } => {
-                let target = if no_rsync { None } else { to.or(rsync_target) };
+            Commands::Record { output, to, no_discord, no_stream, keep_archive, message, dry_run, ros2_args } => {
+                let target = if no_stream { None } else { to.or(stream_target) };
                 let send_discord = !no_discord && discord_active;
                 return handle_record(output, keep_archive, message, dry_run, target.as_deref(), send_discord, ros2_args, &cfg).await;
             }
@@ -301,15 +328,15 @@ async fn main() -> Result<()> {
     if cli.raw_args.is_empty() {
         let latest = find_latest_bag_in_dir(Path::new("."))?;
         println!("{}", format!("🔍 Detected latest bag in current directory: {}", latest.display()).bold().cyan());
-        return handle_send(latest, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), discord_active, &cfg).await;
+        return handle_send(latest, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, &cfg).await;
     }
 
-    // Check if raw_arg is a direct key=value config setting (e.g. `bp rsync=user@host:/bags` or `bp discord=off`)
+    // Check if raw_arg is a direct key=value config setting (e.g. `bp to=my-desktop` or `bp discord=off`)
     if cli.raw_args.len() == 1 && cli.raw_args[0].contains('=') && !cli.raw_args[0].starts_with('/') && !cli.raw_args[0].starts_with('.') {
         let parts: Vec<&str> = cli.raw_args[0].splitn(2, '=').collect();
         let key = parts[0];
         let val = parts[1];
-        if matches!(key.to_lowercase().as_str(), "webhook" | "discord" | "rsync" | "to" | "max_size" | "zstd") {
+        if matches!(key.to_lowercase().as_str(), "webhook" | "discord" | "to" | "stream" | "host" | "max_size" | "zstd") {
             return handle_config_action(Some(ConfigAction::Set { key: key.to_string(), value: val.to_string() }), &mut cfg);
         }
     }
@@ -325,10 +352,10 @@ async fn main() -> Result<()> {
     if (first_path.exists() && (first_path.is_dir() || first_arg.ends_with(".db3") || first_arg.ends_with(".mcap")))
         && cli.raw_args.len() == 1
     {
-        return handle_send(first_path, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), discord_active, &cfg).await;
+        return handle_send(first_path, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, &cfg).await;
     }
 
-    handle_record(None, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), discord_active, cli.raw_args, &cfg).await
+    handle_record(None, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, cli.raw_args, &cfg).await
 }
 
 fn print_config(cfg: &Config) -> Result<()> {
@@ -338,7 +365,7 @@ fn print_config(cfg: &Config) -> Result<()> {
         (None, _) => "(Not configured)".to_string(),
     };
 
-    let rsync_status = match (&cfg.rsync_target, cfg.rsync_enabled.unwrap_or(true)) {
+    let stream_status = match (&cfg.stream_target, cfg.stream_enabled.unwrap_or(true)) {
         (Some(target), true) => format!("Enabled ({})", target),
         (Some(target), false) => format!("Disabled (Target: {})", target),
         (None, _) => "(Not configured)".to_string(),
@@ -346,8 +373,8 @@ fn print_config(cfg: &Config) -> Result<()> {
 
     println!("{}", "Current bagpipe configuration:".bold().cyan());
     println!("  Config Path : {}", config::get_config_path()?.display());
+    println!("  Stream Host : {}", stream_status);
     println!("  Discord     : {}", discord_status);
-    println!("  rsync       : {}", rsync_status);
     println!("  Max Upload  : {} MB", cfg.max_file_size_mb.unwrap_or(25));
     println!("  Zstd Level  : {}", cfg.zstd_level.map(|l| format!("Level {} (Manual)", l)).unwrap_or_else(|| "Auto-Tuned (Smart Adaptive)".to_string()));
     Ok(())
@@ -361,11 +388,11 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
         Some(ConfigAction::Get { key }) => match key.to_lowercase().as_str() {
             "webhook" | "webhook_url" => println!("{}", cfg.webhook_url.as_deref().unwrap_or("")),
             "discord" => println!("{}", if cfg.discord_enabled.unwrap_or(true) { "on" } else { "off" }),
-            "rsync" | "rsync_target" | "to" => println!("{}", cfg.rsync_target.as_deref().unwrap_or("")),
-            "rsync_enabled" => println!("{}", if cfg.rsync_enabled.unwrap_or(true) { "on" } else { "off" }),
+            "to" | "stream" | "host" => println!("{}", cfg.stream_target.as_deref().unwrap_or("")),
+            "stream_enabled" => println!("{}", if cfg.stream_enabled.unwrap_or(true) { "on" } else { "off" }),
             "max_size" | "max_size_mb" => println!("{}", cfg.max_file_size_mb.unwrap_or(25)),
             "zstd" | "zstd_level" => println!("{}", cfg.zstd_level.map(|l| l.to_string()).unwrap_or_else(|| "auto".to_string())),
-            other => anyhow::bail!("Unknown config key '{}'. Available keys: webhook, discord, rsync, max_size, zstd", other),
+            other => anyhow::bail!("Unknown config key '{}'. Available keys: to, webhook, discord, stream, max_size, zstd", other),
         },
         Some(ConfigAction::Set { key, value }) => {
             let val_lower = value.to_lowercase();
@@ -385,16 +412,19 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
                         cfg.discord_enabled = Some(true);
                     }
                 }
-                "rsync" | "rsync_target" | "to" => {
+                "stream" => {
+                    cfg.stream_enabled = Some(matches!(val_lower.as_str(), "true" | "1" | "on" | "enable" | "yes"));
+                }
+                "to" | "host" => {
                     if val_lower == "off" || val_lower == "disable" || val_lower == "false" {
-                        cfg.rsync_enabled = Some(false);
+                        cfg.stream_enabled = Some(false);
                     } else if val_lower == "on" || val_lower == "enable" || val_lower == "true" {
-                        cfg.rsync_enabled = Some(true);
+                        cfg.stream_enabled = Some(true);
                     } else if value.is_empty() || value == "null" || value == "none" {
-                        cfg.rsync_target = None;
+                        cfg.stream_target = None;
                     } else {
-                        cfg.rsync_target = Some(value.clone());
-                        cfg.rsync_enabled = Some(true);
+                        cfg.stream_target = Some(value.clone());
+                        cfg.stream_enabled = Some(true);
                     }
                 }
                 "max_size" | "max_size_mb" => {
@@ -412,7 +442,7 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
                         cfg.zstd_level = Some(lvl);
                     }
                 }
-                other => anyhow::bail!("Unknown config key '{}'. Available keys: webhook, discord, rsync, max_size, zstd", other),
+                other => anyhow::bail!("Unknown config key '{}'. Available keys: to, webhook, discord, stream, max_size, zstd", other),
             }
             save_config(cfg)?;
             println!("{}", format!("✓ Set {} = {}", key, value).green().bold());
@@ -584,7 +614,7 @@ async fn handle_record(
     keep_archive: bool,
     custom_message: Option<String>,
     dry_run: bool,
-    rsync_target: Option<&str>,
+    stream_target: Option<&str>,
     send_discord: bool,
     ros2_args: Vec<String>,
     cfg: &Config,
@@ -640,7 +670,7 @@ async fn handle_record(
     }
 
     // Process pipeline
-    handle_send(bag_path, keep_archive, custom_message, dry_run, rsync_target, send_discord, cfg).await
+    handle_send(bag_path, keep_archive, custom_message, dry_run, stream_target, send_discord, cfg).await
 }
 
 async fn handle_send(
@@ -648,7 +678,7 @@ async fn handle_send(
     keep_archive: bool,
     custom_message: Option<String>,
     dry_run: bool,
-    rsync_target: Option<&str>,
+    stream_target: Option<&str>,
     send_discord: bool,
     cfg: &Config,
 ) -> Result<()> {
@@ -666,7 +696,7 @@ async fn handle_send(
 
     let raw_size = summary.total_raw_size_bytes;
     let archive_name = format!("{}.tar.zst", summary.bag_name);
-    let archive_path = if keep_archive || rsync_target.is_some() {
+    let archive_path = if keep_archive || stream_target.is_some() {
         summary.bag_path.parent().unwrap_or_else(|| Path::new(".")).join(&archive_name)
     } else {
         std::env::temp_dir().join(&archive_name)
@@ -714,36 +744,20 @@ async fn handle_send(
     }
 
     if dry_run {
-        println!("{}", "Dry-run enabled: skipped network upload and rsync.".yellow());
+        println!("{}", "Dry-run enabled: skipped network stream and upload.".yellow());
         return Ok(());
     }
 
-    // Handle remote transfer (Auto-detects: IP:PORT -> Direct Stream, SSH Host -> rsync)
-    let mut remote_successful = false;
-    if let Some(target) = rsync_target {
-        // If target looks like an IP or IP:Port (e.g. 192.168.1.10 or 192.168.1.10:8990 or localhost:8990)
-        let is_direct_ip = !target.contains('@') && !target.contains('/');
-        if is_direct_ip {
-            println!("\n{}", format!("Streaming archive directly to {} (Line-Rate Mode)...", target).bold().cyan());
-            match send_direct_stream(&archive_path, target).await {
-                Ok(()) => {
-                    println!("{}", "Successfully streamed to remote receiver!".green().bold());
-                    remote_successful = true;
-                }
-                Err(e) => {
-                    eprintln!("{} Direct stream failed: {:?}", "✗".red().bold(), e);
-                }
+    // Handle Direct Wire-Speed Streaming
+    let mut stream_successful = false;
+    if let Some(target) = stream_target {
+        println!("\n{}", format!("⚡ Direct streaming to {} (Line-Rate)...", target).bold().cyan());
+        match send_direct_stream(&archive_path, target).await {
+            Ok(()) => {
+                stream_successful = true;
             }
-        } else {
-            println!("\n{}", format!("Transmitting archive via rsync to {}...", target).bold().cyan());
-            match sync_to_remote(&archive_path, target) {
-                Ok(()) => {
-                    println!("{}", "Successfully synced to remote target via rsync!".green().bold());
-                    remote_successful = true;
-                }
-                Err(e) => {
-                    eprintln!("{} Failed to rsync: {:?}", "✗".red().bold(), e);
-                }
+            Err(e) => {
+                eprintln!("{} Direct stream failed: {:?}", "✗".red().bold(), e);
             }
         }
     }
@@ -761,7 +775,7 @@ async fn handle_send(
                 upload_pb.enable_steady_tick(std::time::Duration::from_millis(80));
                 upload_pb.set_message("Uploading report to Discord...");
 
-                let synced_str = if remote_successful { rsync_target } else { None };
+                let synced_str = if stream_successful { stream_target } else { None };
 
                 let res = send_to_discord(
                     webhook_url.trim(),
@@ -786,17 +800,18 @@ async fn handle_send(
                 }
             }
         }
-    } else if rsync_target.is_none() {
+    } else if stream_target.is_none() {
         println!("\n{}", "No remote destination active!".yellow().bold());
-        println!("Enable Discord with: {}", "bp discord=on".cyan());
-        println!("Or enable rsync with: {}", "bp rsync=on".cyan());
+        println!("Stream directly with: {}", "bp -t my-desktop".cyan());
+        println!("Or enable Discord:     {}", "bp discord=on".cyan());
     }
 
-    if !keep_archive && archive_path.exists() && rsync_target.is_none() {
+    if !keep_archive && archive_path.exists() && stream_target.is_none() {
         let _ = std::fs::remove_file(&archive_path);
     }
 
     Ok(())
 }
+
 
 

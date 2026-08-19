@@ -40,6 +40,7 @@ tempfile = "3.10"
 human_bytes = "0.4"
 ctrlc = "3.4"
 mimalloc = { version = "0.1", default-features = false }
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

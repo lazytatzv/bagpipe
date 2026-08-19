@@ -91,6 +91,7 @@ dependencies = [
  "dirs",
  "human_bytes",
  "indicatif",
+ "libc",
  "mimalloc",
  "reqwest",
  "serde",

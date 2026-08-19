@@ -78,19 +78,36 @@ pub async fn send_direct_stream(file_path: &Path, target_addr: &str) -> Result<(
     Ok(())
 }
 
-/// Receives a stream and automatically unpacks it.
-pub async fn receive_stream(listen_port: u16, auto_unpack: bool, auto_play: bool) -> Result<PathBuf> {
+/// Receives streams continuously (server daemon mode) or for a single file.
+pub async fn run_server(listen_port: u16, auto_unpack: bool, auto_play: bool, continuous: bool) -> Result<()> {
     let bind_addr = format!("0.0.0.0:{}", listen_port);
     let listener = TcpListener::bind(&bind_addr).await
         .with_context(|| format!("Failed to bind listener on port {}", listen_port))?;
 
-    println!("{}", "🚀 bagpipe Direct Receiver Online".bold().cyan());
+    println!("{}", "🚀 bagpipe Server Online".bold().cyan());
     println!("  Listening on   : {}", bind_addr.yellow().bold());
-    println!("  Status         : Ready for incoming high-speed stream...");
+    println!("  Mode           : {}", if continuous { "Persistent Server (loop)".green() } else { "Single Transfer".dimmed() });
+    println!("  Status         : Ready for incoming bags...\n");
 
-    let (mut stream, peer_addr) = listener.accept().await?;
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        println!("{}", format!("⚡ Connected from {}", peer_addr).green().bold());
+
+        if let Err(e) = handle_connection(stream, auto_unpack, auto_play).await {
+            eprintln!("{} Connection error: {:?}", "✗".red().bold(), e);
+        }
+
+        if !continuous {
+            break;
+        }
+        println!("\n{}", "Waiting for next bag...".dimmed());
+    }
+
+    Ok(())
+}
+
+async fn handle_connection(mut stream: TcpStream, auto_unpack: bool, auto_play: bool) -> Result<PathBuf> {
     stream.set_nodelay(true)?;
-    println!("\n{}", format!("⚡ Connected from {}", peer_addr).green().bold());
 
     // 1. Verify Magic
     let mut magic = [0u8; 8];
@@ -159,3 +176,77 @@ pub async fn receive_stream(listen_port: u16, auto_unpack: bool, auto_play: bool
 
     Ok(output_path)
 }
+
+fn get_pid_file() -> Result<PathBuf> {
+    let base = dirs::config_dir().context("Failed to find config directory")?;
+    Ok(base.join("bagpipe").join("server.pid"))
+}
+
+pub fn start_daemon(port: u16, play: bool) -> Result<()> {
+    let pid_file = get_pid_file()?;
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            // Check if process is alive
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                println!("{}", format!("Server already running in background (PID: {})", pid).yellow().bold());
+                return Ok(());
+            }
+        }
+    }
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("server").arg("-p").arg(port.to_string());
+    if play {
+        cmd.arg("--play");
+    }
+
+    // Spawn detached daemon
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+
+    let child = cmd.spawn().context("Failed to start background server")?;
+    let pid = child.id();
+
+    if let Some(parent) = pid_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&pid_file, pid.to_string())?;
+
+    println!("{}", "✓ Server started in background!".green().bold());
+    println!("  PID  : {}", pid.to_string().bold());
+    println!("  Port : {}", port.to_string().bold());
+    println!("  Stop with: {}", "bp server stop".cyan());
+    Ok(())
+}
+
+pub fn stop_daemon() -> Result<()> {
+    let pid_file = get_pid_file()?;
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+            let _ = std::fs::remove_file(&pid_file);
+            println!("{}", format!("✓ Background server (PID: {}) stopped.", pid).green().bold());
+            return Ok(());
+        }
+    }
+    println!("{}", "No background server running.".yellow());
+    Ok(())
+}
+
+pub fn status_daemon() -> Result<()> {
+    let pid_file = get_pid_file()?;
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                println!("{}", "● Server status: RUNNING (Background)".green().bold());
+                println!("  PID: {}", pid);
+                return Ok(());
+            }
+        }
+    }
+    println!("{}", "○ Server status: STOPPED".dimmed());
+    Ok(())
+}
+

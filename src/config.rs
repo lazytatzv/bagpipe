@@ -7,8 +7,8 @@ use std::path::PathBuf;
 pub struct Config {
     pub webhook_url: Option<String>,
     pub discord_enabled: Option<bool>, // Default true if webhook_url is set
-    pub rsync_target: Option<String>, // e.g. "user@server:/path/to/bags"
-    pub rsync_enabled: Option<bool>,   // Default true if rsync_target is set
+    pub stream_target: Option<String>, // e.g. "my-desktop" or "100.64.0.12" (Tailscale / LAN host)
+    pub stream_enabled: Option<bool>,  // Default true if stream_target is set
     pub max_file_size_mb: Option<u64>,
     pub zstd_level: Option<i32>,
 }
@@ -18,8 +18,8 @@ impl Default for Config {
         Self {
             webhook_url: None,
             discord_enabled: Some(true),
-            rsync_target: None,
-            rsync_enabled: Some(true),
+            stream_target: None,
+            stream_enabled: Some(true),
             max_file_size_mb: Some(25), // Discord standard max upload size
             zstd_level: None,           // None = Smart Adaptive Auto-Tuning
         }

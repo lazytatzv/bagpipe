@@ -1,6 +1,6 @@
 # bagpipe (`bp`)
 
-Record, zstd-compress, ship, and unpack ROS 2 bags via **Direct Stream (LAN / Tailscale)**, **rsync**, and **Discord** in one breath.
+Record, compress (multi-threaded zstd), ship at wire-speed, and auto-play ROS 2 bags.
 
 ## Install
 
@@ -10,75 +10,55 @@ cargo install bagpipe-ros
 
 ## Quick Start
 
-### 1. High-Speed Direct Stream (Tailscale / LAN — Zero SSH Overhead)
+### 1. Send & Stream (Sender / Robot)
 
-On Receiver (Development PC / Server):
+Set default host once:
 ```bash
-bp listen              # listen for incoming streams & auto-extract
-bp listen --play       # listen & immediately start `ros2 bag play` on arrival
+bp to=192.168.1.50     # or hostname (e.g. workstation)
 ```
 
-On Sender (Robot):
-```bash
-# Record & stream directly to Tailscale MagicDNS name or IP at wire speed
-bp -a -t my-desktop
-bp -a -t 100.64.0.12
-
-# Stream existing bag
-bp -t my-desktop
-```
-
-### 2. Set default destinations (run once)
-
-```bash
-bp rsync=user@server:/path/to/bags   # or bp to=my-desktop
-bp webhook="https://discord.com/api/webhooks/..."
-```
-
-### 3. Record & auto-ship on Ctrl+C
-
+Record & stream directly on `Ctrl+C`:
 ```bash
 bp -a
-bp /camera/image_raw /cmd_vel -m "field test"
+bp /camera/image_raw /cmd_vel -m "test run 1"
 ```
 
-### 4. Ship existing bags
-
+Stream an existing bag:
 ```bash
-bp                    # auto-detect and ship latest bag
-bp ./my_rosbag_dir    # ship specific bag
+bp                     # detect & stream latest bag
+bp ./my_bag            # stream specific bag
 ```
 
-### 5. Unpack & Play (Receiving side)
+### 2. Receive & Play (Receiver / Server)
 
+Start receiver server:
 ```bash
-bp ./my_bag.tar.zst   # auto-extract archive & print summary
-bp unpack             # unpack latest .tar.zst in current directory
-bp play               # extract (if compressed) & play via `ros2 bag play`
-bp play --loop -r 2.0 # pass transparent args to `ros2 bag play`
+bp server start        # run in background (daemon)
+bp server stop         # stop background server
+bp server status       # check server status
+bp server              # run in foreground
 ```
 
-### 6. Inspect bag metadata
-
+Unpack or play received bags manually:
 ```bash
-bp info               # print topics, messages, duration
+bp ./my_bag.tar.zst    # unpack & show summary
+bp play                # unpack & immediately play with `ros2 bag play`
+bp play --loop -r 2.0  # pass transparent args to `ros2 bag play`
 ```
 
-## Toggle & Configuration
+### 3. Discord Notifications (Optional)
 
 ```bash
-# Enable / disable destinations
-bp discord=on / off
-bp rsync=on / off
+bp webhook="https://discord.com/api/webhooks/..."
+bp discord=off / on    # toggle alerts
+```
 
-# Ad-hoc disable for a single run
-bp -a --no-discord
-bp -a --no-rsync
+## Configuration
 
-# Check / customize settings
-bp config
-bp zstd=19            # manual compression level (1-22 or auto)
-bp config reset
+```bash
+bp config              # view all settings
+bp zstd=19             # set compression level (1-22 or auto)
+bp config reset        # reset to defaults
 ```
 
 ## License
