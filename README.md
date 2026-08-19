@@ -5,7 +5,7 @@ Record, zstd-compress, and ship ROS 2 bags via **rsync** and/or **Discord** in o
 ## Install
 
 ```bash
-cargo install --git https://github.com/lazytatzv/bagpipe
+cargo install bagpipe-ros
 ```
 
 ## Quick Start
