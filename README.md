@@ -56,11 +56,13 @@ bp discord=off / on    # toggle alerts
 ## Toggle & Configuration
 
 ```bash
-# Enable / disable streaming and Discord independently
+# Enable / disable features independently
+bp compress=off / on   # toggle zstd compression (skip archive)
 bp stream=off / on     # toggle direct network streaming
-bp discord=off / on    # toggle Discord webhook upload
+bp discord=off / on    # toggle Discord webhook alerts
 
 # Ad-hoc disable for a single run
+bp -a --no-compress    # record raw bag without zstd compression
 bp -a --no-stream      # record & compress, but don't stream
 bp -a --no-discord     # record & compress, but don't notify Discord
 

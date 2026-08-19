@@ -58,6 +58,10 @@ struct Cli {
     #[arg(long)]
     no_stream: bool,
 
+    /// Disable zstd compression (skip archive creation)
+    #[arg(long)]
+    no_compress: bool,
+
     /// Custom comment/note to include in Discord message
     #[arg(short = 'm', long = "message", value_name = "TEXT")]
     message: Option<String>,
@@ -96,6 +100,10 @@ enum Commands {
         #[arg(long)]
         no_stream: bool,
 
+        /// Disable zstd compression
+        #[arg(long)]
+        no_compress: bool,
+
         /// Keep compressed .tar.zst archive in output directory
         #[arg(short = 'k', long = "keep")]
         keep_archive: bool,
@@ -130,6 +138,10 @@ enum Commands {
         /// Disable stream transfer for this run
         #[arg(long)]
         no_stream: bool,
+
+        /// Disable zstd compression
+        #[arg(long)]
+        no_compress: bool,
 
         /// Keep compressed .tar.zst archive after sending
         #[arg(short = 'k', long = "keep")]
@@ -266,10 +278,11 @@ async fn main() -> Result<()> {
     };
 
     let discord_active = !cli.no_discord && cfg.discord_enabled.unwrap_or(true);
+    let compress_active = !cli.no_compress && cfg.compress_enabled.unwrap_or(true);
 
     // 3. Handle explicit -f / --file
     if let Some(bag_path) = cli.file {
-        return handle_send(bag_path, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, &cfg).await;
+        return handle_send(bag_path, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, compress_active, &cfg).await;
     }
 
     // 4. Subcommands
@@ -310,16 +323,18 @@ async fn main() -> Result<()> {
                 let bag_path = resolve_bag_path(path)?;
                 return handle_info(&bag_path);
             }
-            Commands::Send { path, to, no_discord, no_stream, keep_archive, message, dry_run } => {
+            Commands::Send { path, to, no_discord, no_stream, no_compress, keep_archive, message, dry_run } => {
                 let bag_path = resolve_bag_path(path)?;
                 let target = if no_stream { None } else { to.or(stream_target) };
                 let send_discord = !no_discord && discord_active;
-                return handle_send(bag_path, keep_archive, message, dry_run, target.as_deref(), send_discord, &cfg).await;
+                let do_compress = !no_compress && compress_active;
+                return handle_send(bag_path, keep_archive, message, dry_run, target.as_deref(), send_discord, do_compress, &cfg).await;
             }
-            Commands::Record { output, to, no_discord, no_stream, keep_archive, message, dry_run, ros2_args } => {
+            Commands::Record { output, to, no_discord, no_stream, no_compress, keep_archive, message, dry_run, ros2_args } => {
                 let target = if no_stream { None } else { to.or(stream_target) };
                 let send_discord = !no_discord && discord_active;
-                return handle_record(output, keep_archive, message, dry_run, target.as_deref(), send_discord, ros2_args, &cfg).await;
+                let do_compress = !no_compress && compress_active;
+                return handle_record(output, keep_archive, message, dry_run, target.as_deref(), send_discord, do_compress, ros2_args, &cfg).await;
             }
         }
     }
@@ -328,15 +343,15 @@ async fn main() -> Result<()> {
     if cli.raw_args.is_empty() {
         let latest = find_latest_bag_in_dir(Path::new("."))?;
         println!("{}", format!("🔍 Detected latest bag in current directory: {}", latest.display()).bold().cyan());
-        return handle_send(latest, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, &cfg).await;
+        return handle_send(latest, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, compress_active, &cfg).await;
     }
 
-    // Check if raw_arg is a direct key=value config setting (e.g. `bp to=my-desktop` or `bp discord=off`)
+    // Check if raw_arg is a direct key=value config setting (e.g. `bp to=my-desktop` or `bp discord=off` or `bp compress=off`)
     if cli.raw_args.len() == 1 && cli.raw_args[0].contains('=') && !cli.raw_args[0].starts_with('/') && !cli.raw_args[0].starts_with('.') {
         let parts: Vec<&str> = cli.raw_args[0].splitn(2, '=').collect();
         let key = parts[0];
         let val = parts[1];
-        if matches!(key.to_lowercase().as_str(), "webhook" | "discord" | "to" | "stream" | "host" | "max_size" | "zstd") {
+        if matches!(key.to_lowercase().as_str(), "webhook" | "discord" | "to" | "stream" | "host" | "compress" | "zstd" | "max_size") {
             return handle_config_action(Some(ConfigAction::Set { key: key.to_string(), value: val.to_string() }), &mut cfg);
         }
     }
@@ -352,10 +367,10 @@ async fn main() -> Result<()> {
     if (first_path.exists() && (first_path.is_dir() || first_arg.ends_with(".db3") || first_arg.ends_with(".mcap")))
         && cli.raw_args.len() == 1
     {
-        return handle_send(first_path, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, &cfg).await;
+        return handle_send(first_path, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, compress_active, &cfg).await;
     }
 
-    handle_record(None, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, cli.raw_args, &cfg).await
+    handle_record(None, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, compress_active, cli.raw_args, &cfg).await
 }
 
 fn print_config(cfg: &Config) -> Result<()> {
@@ -371,12 +386,18 @@ fn print_config(cfg: &Config) -> Result<()> {
         (None, _) => "(Not configured)".to_string(),
     };
 
+    let compress_status = if cfg.compress_enabled.unwrap_or(true) {
+        cfg.zstd_level.map(|l| format!("Enabled (Zstd L{}, Manual)", l)).unwrap_or_else(|| "Enabled (Auto-Tuned Zstd)".to_string())
+    } else {
+        "Disabled (Raw Bag uncompressed)".to_string()
+    };
+
     println!("{}", "Current bagpipe configuration:".bold().cyan());
     println!("  Config Path : {}", config::get_config_path()?.display());
     println!("  Stream Host : {}", stream_status);
     println!("  Discord     : {}", discord_status);
+    println!("  Compression : {}", compress_status);
     println!("  Max Upload  : {} MB", cfg.max_file_size_mb.unwrap_or(25));
-    println!("  Zstd Level  : {}", cfg.zstd_level.map(|l| format!("Level {} (Manual)", l)).unwrap_or_else(|| "Auto-Tuned (Smart Adaptive)".to_string()));
     Ok(())
 }
 
@@ -390,9 +411,10 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
             "discord" => println!("{}", if cfg.discord_enabled.unwrap_or(true) { "on" } else { "off" }),
             "to" | "stream" | "host" | "send" => println!("{}", cfg.stream_target.as_deref().unwrap_or("")),
             "stream_enabled" | "send_enabled" => println!("{}", if cfg.stream_enabled.unwrap_or(true) { "on" } else { "off" }),
+            "compress" | "compression" | "zstd_enabled" => println!("{}", if cfg.compress_enabled.unwrap_or(true) { "on" } else { "off" }),
             "max_size" | "max_size_mb" => println!("{}", cfg.max_file_size_mb.unwrap_or(25)),
             "zstd" | "zstd_level" => println!("{}", cfg.zstd_level.map(|l| l.to_string()).unwrap_or_else(|| "auto".to_string())),
-            other => anyhow::bail!("Unknown config key '{}'. Available keys: to, stream, discord, webhook, max_size, zstd", other),
+            other => anyhow::bail!("Unknown config key '{}'. Available keys: to, stream, discord, webhook, compress, zstd, max_size", other),
         },
         Some(ConfigAction::Set { key, value }) => {
             let val_lower = value.to_lowercase();
@@ -411,6 +433,9 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
                         cfg.webhook_url = Some(value.clone());
                         cfg.discord_enabled = Some(true);
                     }
+                }
+                "compress" | "compression" => {
+                    cfg.compress_enabled = Some(matches!(val_lower.as_str(), "true" | "1" | "on" | "enable" | "yes"));
                 }
                 "stream" | "send" => {
                     if val_lower == "off" || val_lower == "disable" || val_lower == "false" {
@@ -439,17 +464,23 @@ fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Resul
                     cfg.max_file_size_mb = Some(mb);
                 }
                 "zstd" | "zstd_level" => {
-                    if value == "auto" || value == "null" || value == "none" {
+                    if val_lower == "off" || val_lower == "disable" || val_lower == "false" {
+                        cfg.compress_enabled = Some(false);
+                    } else if val_lower == "on" || val_lower == "enable" || val_lower == "true" {
+                        cfg.compress_enabled = Some(true);
+                    } else if value == "auto" || value == "null" || value == "none" {
                         cfg.zstd_level = None;
+                        cfg.compress_enabled = Some(true);
                     } else {
-                        let lvl: i32 = value.parse().context("zstd_level must be between 1 and 22, or 'auto'")?;
+                        let lvl: i32 = value.parse().context("zstd_level must be between 1 and 22, 'auto', or 'off'")?;
                         if !(1..=22).contains(&lvl) {
                             anyhow::bail!("zstd level must be between 1 and 22");
                         }
                         cfg.zstd_level = Some(lvl);
+                        cfg.compress_enabled = Some(true);
                     }
                 }
-                other => anyhow::bail!("Unknown config key '{}'. Available keys: to, webhook, discord, stream, max_size, zstd", other),
+                other => anyhow::bail!("Unknown config key '{}'. Available keys: to, stream, discord, webhook, compress, max_size, zstd", other),
             }
             save_config(cfg)?;
             println!("{}", format!("✓ Set {} = {}", key, value).green().bold());
@@ -623,6 +654,7 @@ async fn handle_record(
     dry_run: bool,
     stream_target: Option<&str>,
     send_discord: bool,
+    do_compress: bool,
     ros2_args: Vec<String>,
     cfg: &Config,
 ) -> Result<()> {
@@ -646,7 +678,7 @@ async fn handle_record(
 
     println!("{}", "Starting ROS 2 bag recording...".green().bold());
     println!("   Output Directory : {}", bag_output_dir.bold());
-    println!("   (Press {} to stop recording and start compression/pipeline)", "Ctrl+C".yellow().bold());
+    println!("   (Press {} to stop recording and start pipeline)", "Ctrl+C".yellow().bold());
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -677,7 +709,7 @@ async fn handle_record(
     }
 
     // Process pipeline
-    handle_send(bag_path, keep_archive, custom_message, dry_run, stream_target, send_discord, cfg).await
+    handle_send(bag_path, keep_archive, custom_message, dry_run, stream_target, send_discord, do_compress, cfg).await
 }
 
 async fn handle_send(
@@ -687,6 +719,7 @@ async fn handle_send(
     dry_run: bool,
     stream_target: Option<&str>,
     send_discord: bool,
+    do_compress: bool,
     cfg: &Config,
 ) -> Result<()> {
     let pb = ProgressBar::new_spinner();
@@ -709,45 +742,56 @@ async fn handle_send(
         std::env::temp_dir().join(&archive_name)
     };
 
-    let max_mb = cfg.max_file_size_mb.unwrap_or(25);
-    let max_bytes = max_mb * 1024 * 1024;
-    let (mut zstd_level, mut mode_desc) = match cfg.zstd_level {
-        Some(lvl) if lvl > 0 => (lvl, "User-configured"),
-        _ => crate::compress::determine_optimal_zstd_level(&summary, max_mb),
-    };
+    let mut final_archive_opt = None;
+    let mut compressed_size_opt = None;
 
-    pb.set_message(format!("Compressing with zstd (Level {}, {})...", zstd_level, mode_desc));
+    if do_compress {
+        let max_mb = cfg.max_file_size_mb.unwrap_or(25);
+        let max_bytes = max_mb * 1024 * 1024;
+        let (mut zstd_level, mut mode_desc) = match cfg.zstd_level {
+            Some(lvl) if lvl > 0 => (lvl, "User-configured"),
+            _ => crate::compress::determine_optimal_zstd_level(&summary, max_mb),
+        };
 
-    let comp_start = std::time::Instant::now();
-    let mut compressed_size = compress_bag_dir(&summary.bag_path, &archive_path, zstd_level)
-        .with_context(|| format!("Failed to compress bag directory to {}", archive_path.display()))?;
+        pb.set_message(format!("Compressing with zstd (Level {}, {})...", zstd_level, mode_desc));
 
-    // If compressed size is slightly over the Discord limit (<= 1.35x limit), re-compress at max level (19)
-    if compressed_size > max_bytes && compressed_size <= (max_bytes as f64 * 1.35) as u64 && zstd_level < 19 && cfg.zstd_level.is_none() {
-        pb.set_message("Size close to limit: re-compressing with Ultra zstd (Level 19) to fit Discord...".to_string());
-        zstd_level = 19;
-        mode_desc = "Ultra max-compression (fit Discord limit)";
-        if let Ok(new_size) = compress_bag_dir(&summary.bag_path, &archive_path, zstd_level) {
-            compressed_size = new_size;
+        let comp_start = std::time::Instant::now();
+        let mut compressed_size = compress_bag_dir(&summary.bag_path, &archive_path, zstd_level)
+            .with_context(|| format!("Failed to compress bag directory to {}", archive_path.display()))?;
+
+        // If compressed size is slightly over the Discord limit (<= 1.35x limit), re-compress at max level (19)
+        if compressed_size > max_bytes && compressed_size <= (max_bytes as f64 * 1.35) as u64 && zstd_level < 19 && cfg.zstd_level.is_none() {
+            pb.set_message("Size close to limit: re-compressing with Ultra zstd (Level 19) to fit Discord...".to_string());
+            zstd_level = 19;
+            mode_desc = "Ultra max-compression (fit Discord limit)";
+            if let Ok(new_size) = compress_bag_dir(&summary.bag_path, &archive_path, zstd_level) {
+                compressed_size = new_size;
+            }
         }
-    }
 
-    let comp_elapsed = comp_start.elapsed();
+        let comp_elapsed = comp_start.elapsed();
+        let ratio = if raw_size > 0 {
+            (compressed_size as f64 / raw_size as f64) * 100.0
+        } else {
+            100.0
+        };
 
-    let ratio = if raw_size > 0 {
-        (compressed_size as f64 / raw_size as f64) * 100.0
+        pb.finish_and_clear();
+
+        println!("{}", "Compression Complete!".green().bold());
+        println!("  Original Size : {}", human_bytes::human_bytes(raw_size as f64).cyan());
+        println!("  Compressed    : {}", human_bytes::human_bytes(compressed_size as f64).green().bold());
+        println!("  Ratio         : {:.1}% (in {:.2}s, zstd: L{} {})", ratio, comp_elapsed.as_secs_f64(), zstd_level, mode_desc.dimmed());
+        if keep_archive {
+            println!("  Archive Saved : {}", archive_path.display());
+        }
+        final_archive_opt = Some(archive_path.clone());
+        compressed_size_opt = Some(compressed_size);
     } else {
-        100.0
-    };
-
-    pb.finish_and_clear();
-
-    println!("{}", "Compression Complete!".green().bold());
-    println!("  Original Size : {}", human_bytes::human_bytes(raw_size as f64).cyan());
-    println!("  Compressed    : {}", human_bytes::human_bytes(compressed_size as f64).green().bold());
-    println!("  Ratio         : {:.1}% (in {:.2}s, zstd: L{} {})", ratio, comp_elapsed.as_secs_f64(), zstd_level, mode_desc.dimmed());
-    if keep_archive {
-        println!("  Archive Saved : {}", archive_path.display());
+        pb.finish_and_clear();
+        println!("{}", "Compression skipped (uncompressed mode).".yellow());
+        println!("  Bag Path      : {}", summary.bag_path.display().to_string().bold());
+        println!("  Raw Size      : {}", human_bytes::human_bytes(raw_size as f64).cyan());
     }
 
     if dry_run {
@@ -758,8 +802,21 @@ async fn handle_send(
     // Handle Direct Wire-Speed Streaming
     let mut stream_successful = false;
     if let Some(target) = stream_target {
+        // Stream archive if compressed, or create temp tar if uncompressed
+        let to_send_path = if let Some(ref arch) = final_archive_opt {
+            arch.clone()
+        } else {
+            // For streaming raw directory, package tar without compression
+            let temp_tar = std::env::temp_dir().join(format!("{}.tar", summary.bag_name));
+            let out_file = std::fs::File::create(&temp_tar)?;
+            let mut tar_b = tar::Builder::new(out_file);
+            tar_b.append_dir_all(summary.bag_path.file_name().unwrap(), &summary.bag_path)?;
+            tar_b.finish()?;
+            temp_tar
+        };
+
         println!("\n{}", format!("⚡ Direct streaming to {} (Line-Rate)...", target).bold().cyan());
-        match send_direct_stream(&archive_path, target).await {
+        match send_direct_stream(&to_send_path, target).await {
             Ok(()) => {
                 stream_successful = true;
             }
@@ -783,13 +840,14 @@ async fn handle_send(
                 upload_pb.set_message("Uploading report to Discord...");
 
                 let synced_str = if stream_successful { stream_target } else { None };
+                let max_mb = cfg.max_file_size_mb.unwrap_or(25);
 
                 let res = send_to_discord(
                     webhook_url.trim(),
                     &summary,
-                    Some(&archive_path),
+                    final_archive_opt.as_deref(),
                     raw_size,
-                    Some(compressed_size),
+                    compressed_size_opt,
                     max_mb,
                     custom_message.as_deref(),
                     synced_str,
@@ -819,6 +877,7 @@ async fn handle_send(
 
     Ok(())
 }
+
 
 
 

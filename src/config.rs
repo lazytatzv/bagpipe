@@ -9,6 +9,7 @@ pub struct Config {
     pub discord_enabled: Option<bool>, // Default true if webhook_url is set
     pub stream_target: Option<String>, // e.g. "my-desktop" or "100.64.0.12" (Tailscale / LAN host)
     pub stream_enabled: Option<bool>,  // Default true if stream_target is set
+    pub compress_enabled: Option<bool>, // Default true (zstd compression)
     pub max_file_size_mb: Option<u64>,
     pub zstd_level: Option<i32>,
 }
@@ -20,6 +21,7 @@ impl Default for Config {
             discord_enabled: Some(true),
             stream_target: None,
             stream_enabled: Some(true),
+            compress_enabled: Some(true),
             max_file_size_mb: Some(25), // Discord standard max upload size
             zstd_level: None,           // None = Smart Adaptive Auto-Tuning
         }
