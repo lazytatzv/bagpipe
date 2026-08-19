@@ -339,7 +339,8 @@ async fn handle_send(
     };
 
     let max_mb = cfg.max_file_size_mb.unwrap_or(25);
-    let (zstd_level, mode_desc) = match cfg.zstd_level {
+    let max_bytes = max_mb * 1024 * 1024;
+    let (mut zstd_level, mut mode_desc) = match cfg.zstd_level {
         Some(lvl) if lvl > 0 => (lvl, "User-configured"),
         _ => crate::compress::determine_optimal_zstd_level(&summary, max_mb),
     };
@@ -347,8 +348,19 @@ async fn handle_send(
     pb.set_message(format!("Compressing with zstd (Level {}, {})...", zstd_level, mode_desc));
 
     let comp_start = std::time::Instant::now();
-    let compressed_size = compress_bag_dir(&summary.bag_path, &archive_path, zstd_level)
+    let mut compressed_size = compress_bag_dir(&summary.bag_path, &archive_path, zstd_level)
         .with_context(|| format!("Failed to compress bag directory to {}", archive_path.display()))?;
+
+    // If compressed size is slightly over the Discord limit (<= 1.3x limit), re-compress at max level (19)
+    if compressed_size > max_bytes && compressed_size <= (max_bytes as f64 * 1.35) as u64 && zstd_level < 19 && cfg.zstd_level.is_none() {
+        pb.set_message("Size close to limit: re-compressing with Ultra zstd (Level 19) to fit Discord...".to_string());
+        zstd_level = 19;
+        mode_desc = "Ultra max-compression (fit Discord limit)";
+        if let Ok(new_size) = compress_bag_dir(&summary.bag_path, &archive_path, zstd_level) {
+            compressed_size = new_size;
+        }
+    }
+
     let comp_elapsed = comp_start.elapsed();
 
     let ratio = if raw_size > 0 {
