@@ -121,19 +121,10 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Initialize or update configuration (Discord Webhook / rsync target)
-    Init {
-        /// Discord Webhook URL
-        #[arg(long)]
-        webhook: Option<String>,
-
-        /// Remote rsync destination (e.g. `user@host:/path/to/bags`)
-        #[arg(long)]
-        rsync: Option<String>,
-
-        /// Max upload file size in MB for Discord (default: 25)
-        #[arg(long, default_value = "25")]
-        max_size_mb: u64,
+    /// Manage configuration (view, set, get, or interactive edit)
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
     },
 
     /// Inspect and print ROS 2 bag summary without uploading
@@ -141,6 +132,26 @@ enum Commands {
         /// Path to ROS 2 bag directory (defaults to latest in current directory)
         path: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    /// Get a specific configuration key
+    Get {
+        /// Key name (webhook, rsync, max_size, zstd)
+        key: String,
+    },
+    /// Set a specific configuration key
+    Set {
+        /// Key name (webhook, rsync, max_size, zstd)
+        key: String,
+        /// Value to set (use "null" or "auto" for zstd)
+        value: String,
+    },
+    /// Open the config file in your default $EDITOR
+    Edit,
+    /// Reset configuration to default
+    Reset,
 }
 
 #[tokio::main]
@@ -167,12 +178,7 @@ async fn main() -> Result<()> {
 
     // 2. Handle --config
     if cli.config {
-        println!("{}", "⚙️  Current bagpipe configuration:".bold().cyan());
-        println!("  Config Path : {}", config::get_config_path()?.display());
-        println!("  Webhook URL : {}", cfg.webhook_url.as_deref().unwrap_or("(Not configured)"));
-        println!("  rsync Target: {}", cfg.rsync_target.as_deref().unwrap_or("(Not configured)"));
-        println!("  Max Upload  : {} MB", cfg.max_file_size_mb.unwrap_or(25));
-        println!("  Zstd Level  : {}", cfg.zstd_level.map(|l| l.to_string()).unwrap_or_else(|| "Auto-Tuned".to_string()));
+        print_config(&cfg)?;
         return Ok(());
     }
 
@@ -186,19 +192,8 @@ async fn main() -> Result<()> {
     // 4. Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
-            Commands::Init { webhook, rsync, max_size_mb } => {
-                if let Some(w) = webhook {
-                    cfg.webhook_url = Some(w);
-                }
-                if let Some(r) = rsync {
-                    cfg.rsync_target = Some(r);
-                }
-                cfg.max_file_size_mb = Some(max_size_mb);
-                save_config(&cfg)?;
-                println!("{}", "✓ Configuration saved!".green().bold());
-                if let Some(w) = &cfg.webhook_url { println!("  Webhook URL : {}", w); }
-                if let Some(r) = &cfg.rsync_target { println!("  rsync Target: {}", r); }
-                return Ok(());
+            Commands::Config { action } => {
+                return handle_config_action(action, &mut cfg);
             }
             Commands::Info { path } => {
                 let bag_path = resolve_bag_path(path)?;
@@ -234,6 +229,77 @@ async fn main() -> Result<()> {
 
     handle_record(None, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), cli.raw_args, &cfg).await
 }
+
+fn print_config(cfg: &Config) -> Result<()> {
+    println!("{}", "Current bagpipe configuration:".bold().cyan());
+    println!("  Config Path : {}", config::get_config_path()?.display());
+    println!("  Webhook URL : {}", cfg.webhook_url.as_deref().unwrap_or("(Not configured)"));
+    println!("  rsync Target: {}", cfg.rsync_target.as_deref().unwrap_or("(Not configured)"));
+    println!("  Max Upload  : {} MB", cfg.max_file_size_mb.unwrap_or(25));
+    println!("  Zstd Level  : {}", cfg.zstd_level.map(|l| format!("Level {} (Manual)", l)).unwrap_or_else(|| "Auto-Tuned (Smart Adaptive)".to_string()));
+    Ok(())
+}
+
+fn handle_config_action(action: Option<ConfigAction>, cfg: &mut Config) -> Result<()> {
+    match action {
+        None => {
+            print_config(cfg)?;
+        }
+        Some(ConfigAction::Get { key }) => match key.to_lowercase().as_str() {
+            "webhook" | "webhook_url" => println!("{}", cfg.webhook_url.as_deref().unwrap_or("")),
+            "rsync" | "rsync_target" | "to" => println!("{}", cfg.rsync_target.as_deref().unwrap_or("")),
+            "max_size" | "max_size_mb" => println!("{}", cfg.max_file_size_mb.unwrap_or(25)),
+            "zstd" | "zstd_level" => println!("{}", cfg.zstd_level.map(|l| l.to_string()).unwrap_or_else(|| "auto".to_string())),
+            other => anyhow::bail!("Unknown config key '{}'. Available keys: webhook, rsync, max_size, zstd", other),
+        },
+        Some(ConfigAction::Set { key, value }) => {
+            match key.to_lowercase().as_str() {
+                "webhook" | "webhook_url" => {
+                    cfg.webhook_url = if value.is_empty() || value == "null" || value == "none" { None } else { Some(value.clone()) };
+                }
+                "rsync" | "rsync_target" | "to" => {
+                    cfg.rsync_target = if value.is_empty() || value == "null" || value == "none" { None } else { Some(value.clone()) };
+                }
+                "max_size" | "max_size_mb" => {
+                    let mb: u64 = value.parse().context("max_size must be a positive integer (MB)")?;
+                    cfg.max_file_size_mb = Some(mb);
+                }
+                "zstd" | "zstd_level" => {
+                    if value == "auto" || value == "null" || value == "none" {
+                        cfg.zstd_level = None;
+                    } else {
+                        let lvl: i32 = value.parse().context("zstd_level must be between 1 and 22, or 'auto'")?;
+                        if !(1..=22).contains(&lvl) {
+                            anyhow::bail!("zstd level must be between 1 and 22");
+                        }
+                        cfg.zstd_level = Some(lvl);
+                    }
+                }
+                other => anyhow::bail!("Unknown config key '{}'. Available keys: webhook, rsync, max_size, zstd", other),
+            }
+            save_config(cfg)?;
+            println!("{}", format!("✓ Set {} = {}", key, value).green().bold());
+        }
+        Some(ConfigAction::Edit) => {
+            let path = config::get_config_path()?;
+            if !path.exists() {
+                save_config(cfg)?;
+            }
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
+            Command::new(editor)
+                .arg(&path)
+                .status()
+                .context("Failed to open config in editor")?;
+        }
+        Some(ConfigAction::Reset) => {
+            *cfg = Config::default();
+            save_config(cfg)?;
+            println!("{}", "✓ Configuration reset to defaults.".green().bold());
+        }
+    }
+    Ok(())
+}
+
 
 fn resolve_bag_path(path_opt: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = path_opt {

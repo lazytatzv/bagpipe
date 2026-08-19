@@ -105,10 +105,26 @@ Options:
 
 ## Configuration
 
-View current configuration:
+Manage settings dynamically via CLI or editor:
 
 ```bash
-bp --config
+# View current configuration
+bp config
+
+# Set individual keys (webhook, rsync, max_size, zstd)
+bp config set rsync user@gpu-server:/data/bags
+bp config set webhook "https://discord.com/api/webhooks/..."
+bp config set max_size 50
+bp config set zstd 19          # Set manual level (1-22) or 'auto'
+
+# Get specific configuration value
+bp config get rsync
+
+# Open config file directly in your default $EDITOR (e.g. nano/vim)
+bp config edit
+
+# Reset configuration to default values
+bp config reset
 ```
 
 Configuration file is stored at `~/.config/bagpipe/config.json`:
@@ -121,6 +137,11 @@ Configuration file is stored at `~/.config/bagpipe/config.json`:
   "zstd_level": null
 }
 ```
+
+- `webhook_url`: Discord Webhook URL.
+- `rsync_target`: Default remote server destination (`user@host:/path`).
+- `max_file_size_mb`: File upload size threshold in MB for Discord (default: 25).
+- `zstd_level`: `null` for smart adaptive auto-tuning, or an integer from 1 to 22.
 
 ## License
 
