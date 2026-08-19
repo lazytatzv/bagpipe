@@ -42,13 +42,13 @@ pub fn compress_bag_dir(bag_dir: &Path, output_path: &Path, zstd_level: i32) -> 
 
     let out_file = File::create(output_path)
         .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
-    let buf_writer = BufWriter::with_capacity(1024 * 1024, out_file);
+    let buf_writer = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
 
     // Initialize zstd encoder
     let mut encoder = zstd::stream::write::Encoder::new(buf_writer, zstd_level)
         .context("Failed to initialize zstd encoder")?;
     
-    // Enable multi-threading if level permits
+    // Enable multi-threading (0 = auto-detect all available CPU cores)
     let _ = encoder.set_parameter(zstd::zstd_safe::CParameter::NbWorkers(0));
 
     {
@@ -70,7 +70,7 @@ pub fn compress_bag_dir(bag_dir: &Path, output_path: &Path, zstd_level: i32) -> 
 pub fn decompress_archive(archive_path: &Path, output_dir: &Path) -> Result<std::path::PathBuf> {
     let file = File::open(archive_path)
         .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
-    let buf_reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+    let buf_reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
 
     let decoder = zstd::stream::read::Decoder::new(buf_reader)
         .context("Failed to initialize zstd decoder")?;

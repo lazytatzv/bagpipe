@@ -32,11 +32,19 @@ serde_yaml = "0.9"
 anyhow = "1.0"
 chrono = "0.4"
 tar = "0.4"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 dirs = "5.0"
 indicatif = "0.17"
 colored = "2.1"
 tempfile = "3.10"
 human_bytes = "0.4"
 ctrlc = "3.4"
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
 

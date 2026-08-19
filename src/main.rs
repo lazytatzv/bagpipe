@@ -3,6 +3,10 @@ mod compress;
 mod config;
 mod discord;
 mod rsync;
+mod stream;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -18,6 +22,7 @@ use crate::compress::compress_bag_dir;
 use crate::config::{load_config, save_config, Config};
 use crate::discord::send_to_discord;
 use crate::rsync::sync_to_remote;
+use crate::stream::{receive_stream, send_direct_stream};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -145,6 +150,21 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Listen for incoming direct high-speed streams (bypasses SSH for max line-rate)
+    Listen {
+        /// Port to listen on (default: 8990)
+        #[arg(short = 'p', long = "port", default_value = "8990")]
+        port: u16,
+
+        /// Automatically unpack received bag archive
+        #[arg(short = 'u', long = "unpack", default_value = "true")]
+        unpack: bool,
+
+        /// Automatically play bag with `ros2 bag play` immediately after receiving
+        #[arg(long)]
+        play: bool,
+    },
+
     /// Unpack / extract a compressed bag archive (.tar.zst)
     Unpack {
         /// Path to .tar.zst archive (defaults to latest in current directory)
@@ -244,6 +264,10 @@ async fn main() -> Result<()> {
     // 4. Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
+            Commands::Listen { port, unpack, play } => {
+                receive_stream(port, unpack, play).await?;
+                return Ok(());
+            }
             Commands::Unpack { archive, output } => {
                 let archive_path = resolve_archive_path(archive)?;
                 let out_dir = output.unwrap_or_else(|| PathBuf::from("."));
@@ -694,17 +718,32 @@ async fn handle_send(
         return Ok(());
     }
 
-    // Handle rsync transfer if target specified
-    let mut rsync_successful = false;
+    // Handle remote transfer (Auto-detects: IP:PORT -> Direct Stream, SSH Host -> rsync)
+    let mut remote_successful = false;
     if let Some(target) = rsync_target {
-        println!("\n{}", format!("Transmitting archive via rsync to {}...", target).bold().cyan());
-        match sync_to_remote(&archive_path, target) {
-            Ok(()) => {
-                println!("{}", "Successfully synced to remote target via rsync!".green().bold());
-                rsync_successful = true;
+        // If target looks like an IP or IP:Port (e.g. 192.168.1.10 or 192.168.1.10:8990 or localhost:8990)
+        let is_direct_ip = !target.contains('@') && !target.contains('/');
+        if is_direct_ip {
+            println!("\n{}", format!("Streaming archive directly to {} (Line-Rate Mode)...", target).bold().cyan());
+            match send_direct_stream(&archive_path, target).await {
+                Ok(()) => {
+                    println!("{}", "Successfully streamed to remote receiver!".green().bold());
+                    remote_successful = true;
+                }
+                Err(e) => {
+                    eprintln!("{} Direct stream failed: {:?}", "✗".red().bold(), e);
+                }
             }
-            Err(e) => {
-                eprintln!("{} Failed to rsync: {:?}", "✗".red().bold(), e);
+        } else {
+            println!("\n{}", format!("Transmitting archive via rsync to {}...", target).bold().cyan());
+            match sync_to_remote(&archive_path, target) {
+                Ok(()) => {
+                    println!("{}", "Successfully synced to remote target via rsync!".green().bold());
+                    remote_successful = true;
+                }
+                Err(e) => {
+                    eprintln!("{} Failed to rsync: {:?}", "✗".red().bold(), e);
+                }
             }
         }
     }
@@ -722,7 +761,7 @@ async fn handle_send(
                 upload_pb.enable_steady_tick(std::time::Duration::from_millis(80));
                 upload_pb.set_message("Uploading report to Discord...");
 
-                let synced_str = if rsync_successful { rsync_target } else { None };
+                let synced_str = if remote_successful { rsync_target } else { None };
 
                 let res = send_to_discord(
                     webhook_url.trim(),
