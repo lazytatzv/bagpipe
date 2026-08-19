@@ -27,16 +27,23 @@ cargo install --path .
 
 ## Quick Start
 
-### 1. Configuration (Run once)
+### 1. Configuration (Set once, change anytime)
 
-Configure default destinations:
+Set settings directly with `key=value` or subcommands:
 
 ```bash
-# Set default remote server via rsync
-bp --init-rsync user@server:/data/rosbags
+# Set rsync destination server
+bp rsync=user@gpu-server:/data/bags
 
-# And/or configure Discord Webhook
-bp --init "https://discord.com/api/webhooks/your/webhook/url"
+# Set Discord Webhook
+bp webhook="https://discord.com/api/webhooks/your/webhook/url"
+
+# Set compression level (1-22 or auto)
+bp zstd=19
+bp zstd=auto
+
+# View current settings
+bp config
 ```
 
 ### 2. Record & Auto-Ship
@@ -45,21 +52,18 @@ bp --init "https://discord.com/api/webhooks/your/webhook/url"
 # Record all topics -> compress -> auto-rsync / upload on Ctrl+C
 bp -a
 
-# Record and ship to a specific remote server
-bp -a --to user@gpu-server:/data/bags
-
 # Record specific topics with a custom note
-bp /camera/image_raw /cmd_vel -m "Obstacle avoidance test run"
+bp /camera/image_raw /cmd_vel -m "Field test"
+
+# Record and ship to an ad-hoc destination
+bp -a -t user@other-pc:/bags
 ```
 
 ### 3. Ship Existing Bags
 
 ```bash
-# Auto-detect latest recorded bag in current directory and ship
+# Auto-detect latest bag in current directory and ship
 bp
-
-# Ship to a remote machine via rsync
-bp -t user@server:/bags
 
 # Ship a specific bag directory
 bp ./rosbag2_2026_08_19
@@ -68,11 +72,8 @@ bp ./rosbag2_2026_08_19
 ### 4. Inspect Bag Metadata
 
 ```bash
-# Show summary of the latest bag in current directory
+# Summary of the latest bag
 bp info
-
-# Show summary of a specific bag
-bp info ./rosbag2_2026_08_19
 ```
 
 ## Command Reference

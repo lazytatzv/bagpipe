@@ -218,6 +218,16 @@ async fn main() -> Result<()> {
         return handle_send(latest, cli.keep_archive, cli.message, cli.dry_run, rsync_target.as_deref(), &cfg).await;
     }
 
+    // Check if raw_arg is a direct key=value config setting (e.g. `bp rsync=user@host:/bags` or `bp webhook=https://...`)
+    if cli.raw_args.len() == 1 && cli.raw_args[0].contains('=') && !cli.raw_args[0].starts_with('/') && !cli.raw_args[0].starts_with('.') {
+        let parts: Vec<&str> = cli.raw_args[0].splitn(2, '=').collect();
+        let key = parts[0];
+        let val = parts[1];
+        if matches!(key.to_lowercase().as_str(), "webhook" | "rsync" | "to" | "max_size" | "zstd") {
+            return handle_config_action(Some(ConfigAction::Set { key: key.to_string(), value: val.to_string() }), &mut cfg);
+        }
+    }
+
     let first_arg = &cli.raw_args[0];
     let first_path = PathBuf::from(first_arg);
 
