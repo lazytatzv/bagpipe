@@ -1,80 +1,121 @@
-# 🎺 bagpipe (`bp`)
+# bagpipe (`bp`)
 
-> **The ultra-fast, zero-friction ROS 2 bag pipeline tool.**  
-> Record, zstd-compress, summarize, and ship ROS 2 bags directly to Discord in a single breath.
+A fast, lightweight CLI tool to record, zstd-compress, summarize, and upload ROS 2 bags directly to Discord.
 
----
+## Features
 
-## ⚡ 最強にシンプルな使い方 (Ergonomic UX)
+- **Transparent Recording**: Wraps `ros2 bag record`. Automatically compresses and ships the bag when stopped (`Ctrl+C`).
+- **Smart Argument Inference**: Zero friction CLI. Infer recording or upload actions automatically.
+- **Adaptive zstd Compression**: Automatically tunes compression levels (Level 1-9) based on topic types and Discord file size limits.
+- **Metadata Summary**: Extracts duration, message counts, storage format, and topic breakdown from `metadata.yaml` for Discord embeds.
+- **Size Limit Protection**: Handles Discord upload limits (default 25 MB) gracefully without crashing.
+- **Single Binary**: Built with pure Rust. Fast and dependency-free.
 
-`bagpipe`（短縮コマンド: `bp`）はサブコマンドの指定すら省略でき、プロが最もよく行う操作を自動判定します。
+## Installation
 
-### 1. 初回設定（これだけ）
+```bash
+cargo install --git https://github.com/lazytatzv/bagpipe
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/lazytatzv/bagpipe.git
+cd bagpipe
+cargo install --path .
+```
+
+## Quick Start
+
+### 1. Configure Webhook (Run once)
+
 ```bash
 bp --init "https://discord.com/api/webhooks/your/webhook/url"
 ```
 
-### 2. ワンライナー録画 & 自動送信
-`bp` の後ろに `-a` やトピック名を渡すだけで自動録画モードになります。
+### 2. Record & Auto-Send
+
+Run `bp` followed by any standard `ros2 bag record` arguments:
+
 ```bash
-# 全トピック録画 -> Ctrl+C で停止 -> 即座に zstd 圧縮 & Discord へ送信！
+# Record all topics and auto-ship on Ctrl+C
 bp -a
 
-# トピック指定 & メモ付き
-bp /camera/image_raw /cmd_vel -m "屋外障害物回避テスト"
+# Record specific topics with a message
+bp /camera/image_raw /cmd_vel -m "Obstacle avoidance test run"
 ```
 
-### 3. 既存バッグの送信
+### 3. Send Existing Bags
+
 ```bash
-# 今カレントディレクトリにある最新の rosbag を自動検出して Discord へ送信！
+# Auto-detect and send the latest recorded bag in the current directory
 bp
 
-# パス指定で送信
-bp ./my_rosbag_dir
+# Send a specific bag directory
+bp ./rosbag2_2026_08_19
 
-# 圧縮ファイル (.tar.zst) をローカルにも残す場合
-bp ./my_rosbag_dir -k
+# Keep the compressed .tar.zst archive locally
+bp ./rosbag2_2026_08_19 -k
 ```
 
-### 4. メタデータサマリ確認（送信なし）
+### 4. Inspect Bag Metadata
+
 ```bash
-bp info ./my_rosbag_dir
-# またはカレントの最新バッグを確認
+# Show summary of the latest bag in current directory
 bp info
+
+# Show summary of a specific bag
+bp info ./rosbag2_2026_08_19
 ```
 
----
+## Command Reference
 
-## 💡 特徴
+```text
+Usage: bp [OPTIONS] [COMMAND] [RAW_ARGS]...
 
-- **🚀 超軽量・爆速**: ピュア Rust 製（シングルバイナリ）。
-- **🧠 賢い引数自動推論**:
-  - `bp`（引数なし）➔ カレントディレクトリの最新の rosbag を検出して送信
-  - `bp <ディレクトリ>` ➔ 既存バッグを圧縮して送信
-  - `bp -a` または `bp /topic` ➔ `ros2 bag record` を開始し、停止後に自動送信
-- **🗜️ 高速マルチスレッド zstd 圧縮**: `.tar.zst` で劇的にサイズ削減。
-- **📊 丁寧な Embed サマリ**: 録画時間・開始時刻・メッセージ数・トピック内訳テーブルを Discord に見やすく整形。
-- **🛡️ 25MB 上限保護**: Discord の上限を超える巨大バッグでも Webhook エラーで落ちず、サマリ通知＋ローカル保管パスを案内。
+Arguments:
+  [RAW_ARGS]...  Direct bag path (send) or ros2 record arguments (-a, /topic, etc.)
 
----
+Commands:
+  record  Record a ROS 2 bag and automatically compress & upload on stop (Ctrl+C)
+  send    Compress and upload an existing ROS 2 bag
+  info    Inspect and print ROS 2 bag summary without uploading
+  init    Initialize or update Discord Webhook configuration
+  help    Print help information
 
-## 📦 インストール
-
-```bash
-cargo install --path .
+Options:
+      --init <URL>       Save Discord Webhook URL
+      --config           Show current configuration
+  -f, --file <BAG_PATH>  Direct upload of an existing bag
+  -m, --message <TEXT>   Custom comment to include in the Discord message
+  -k, --keep             Keep compressed .tar.zst archive locally
+      --dry-run          Parse and compress without uploading to Discord
+  -h, --help             Print help
+  -V, --version          Print version
 ```
 
----
+## Configuration
 
-## ⚙️ 設定
+View current configuration:
 
-現在の設定を確認:
 ```bash
 bp --config
 ```
-設定ファイル: `~/.config/bagpipe/config.json`
 
----
+Configuration file is stored at `~/.config/bagpipe/config.json`:
 
-## 📄 License
+```json
+{
+  "webhook_url": "https://discord.com/api/webhooks/...",
+  "max_file_size_mb": 25,
+  "zstd_level": null
+}
+```
+
+- `webhook_url`: Discord Webhook URL.
+- `max_file_size_mb`: File upload size threshold in MB (default: 25).
+- `zstd_level`: `null` for smart adaptive auto-tuning, or an integer from 1 to 22.
+
+## License
+
 MIT OR Apache-2.0
