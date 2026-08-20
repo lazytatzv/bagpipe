@@ -370,8 +370,45 @@ async fn main() -> Result<()> {
         return handle_send(first_path, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, compress_active, &cfg).await;
     }
 
-    handle_record(None, cli.keep_archive, cli.message, cli.dry_run, stream_target.as_deref(), discord_active, compress_active, cli.raw_args, &cfg).await
+    let (ros2_args, extracted_message, extracted_to) = filter_bagpipe_args_from_raw(&cli.raw_args);
+    let final_message = cli.message.or(extracted_message);
+    let final_target = stream_target.or(extracted_to);
+
+    handle_record(None, cli.keep_archive, final_message, cli.dry_run, final_target.as_deref(), discord_active, compress_active, ros2_args, &cfg).await
 }
+
+
+fn filter_bagpipe_args_from_raw(args: &[String]) -> (Vec<String>, Option<String>, Option<String>) {
+    let mut ros2_args = Vec::new();
+    let mut message = None;
+    let mut to_target = None;
+    let mut iter = args.iter().peekable();
+
+    while let Some(arg) = iter.next() {
+        if (arg == "-m" || arg == "--message") && iter.peek().is_some() {
+            message = Some(iter.next().unwrap().clone());
+        } else if arg.starts_with("-m=") || arg.starts_with("--message=") {
+            let parts: Vec<&str> = arg.splitn(2, '=').collect();
+            if parts.len() == 2 {
+                message = Some(parts[1].to_string());
+            }
+        } else if (arg == "-t" || arg == "--to") && iter.peek().is_some() {
+            to_target = Some(iter.next().unwrap().clone());
+        } else if arg.starts_with("-t=") || arg.starts_with("--to=") {
+            let parts: Vec<&str> = arg.splitn(2, '=').collect();
+            if parts.len() == 2 {
+                to_target = Some(parts[1].to_string());
+            }
+        } else if arg == "--no-discord" || arg == "--no-stream" || arg == "--no-compress" || arg == "-k" || arg == "--keep" || arg == "--dry-run" {
+            // Internal flags already handled by Clap
+        } else {
+            ros2_args.push(arg.clone());
+        }
+    }
+
+    (ros2_args, message, to_target)
+}
+
 
 fn print_config(cfg: &Config) -> Result<()> {
     let discord_status = match (&cfg.webhook_url, cfg.discord_enabled.unwrap_or(true)) {

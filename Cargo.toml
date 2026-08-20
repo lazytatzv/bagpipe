@@ -1,8 +1,8 @@
 [package]
 name = "bagpipe-ros"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-description = "Fast CLI tool to record, zstd-compress, and ship ROS 2 bags via rsync and Discord."
+description = "Fast CLI tool to record, zstd-compress, and ship ROS 2 bags at wire-speed."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lazytatzv/bagpipe"
 homepage = "https://github.com/lazytatzv/bagpipe"
